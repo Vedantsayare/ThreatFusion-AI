@@ -1,0 +1,93 @@
+# ThreatFusion AI — Docker Compose (Phase 0 infrastructure services)
+#
+# Services: PostgreSQL 16, Redis 7, Neo4j 5 Community
+# All credentials are loaded from the .env file — never hard-coded here.
+# Data volumes are stored under ./docker-data/ which is listed in .gitignore.
+#
+# Usage:
+#   docker compose up -d          Start all services in the background
+#   docker compose ps              Check container status
+#   docker compose logs -f         Follow all logs
+#   docker compose down            Stop and remove containers (data persists in volumes)
+#   docker compose down -v         Stop and DESTROY data volumes (destructive)
+
+services:
+
+  # ── PostgreSQL 16 ─────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: tf_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-threatfusion}"
+      POSTGRES_USER: "${POSTGRES_USER:-threatfusion_user}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"   # must be set in .env
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-threatfusion_user} -d ${POSTGRES_DB:-threatfusion}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── Redis 7 ───────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: tf_redis
+    restart: unless-stopped
+    # Require password; enable persistence via AOF so the stream survives restart
+    command: >
+      redis-server
+      --requirepass "${REDIS_PASSWORD}"
+      --appendonly yes
+      --appendfsync everysec
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Neo4j 5 Community Edition ─────────────────────────────────────────────
+  neo4j:
+    image: neo4j:5-community
+    container_name: tf_neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: "${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD}"
+      # Memory limits — adjust if host RAM is constrained
+      NEO4J_server_memory_heap_initial__size: "512m"
+      NEO4J_server_memory_heap_max__size: "1G"
+      NEO4J_server_memory_pagecache_size: "512m"
+      # Allow connections from any interface inside Docker network
+      NEO4J_dbms_connector_bolt_listen__address: "0.0.0.0:7687"
+      NEO4J_dbms_connector_http_listen__address: "0.0.0.0:7474"
+    ports:
+      - "7474:7474"   # Neo4j Browser (HTTP)
+      - "7687:7687"   # Bolt protocol
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s   # Neo4j JVM takes longer to start
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  neo4j_data:
+    driver: local
+  neo4j_logs:
+    driver: local

@@ -1,0 +1,74 @@
+# ─── SECRETS — never commit these ───────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+secrets/
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+*.whl
+
+# ─── Testing & coverage ──────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+nosetests.xml
+coverage.xml
+*.cover
+
+# ─── Alembic runtime artefacts ───────────────────────────────────────────────
+alembic/versions/__pycache__/
+
+# ─── Node / Frontend ─────────────────────────────────────────────────────────
+dashboard/node_modules/
+dashboard/.vite/
+dashboard/dist/
+dashboard/build/
+
+# ─── Docker ──────────────────────────────────────────────────────────────────
+docker-data/
+postgres-data/
+neo4j-data/
+redis-data/
+
+# ─── IDE / editor ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── Pip cache (offline installs) ────────────────────────────────────────────
+.pip-cache/
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── Jupyter ─────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
