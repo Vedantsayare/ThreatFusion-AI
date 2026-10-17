@@ -1,0 +1,238 @@
+ThreatFusion AI
+Phase 7: LangGraph Orchestration
+Learning guide, workflow architecture, and validation record
+Source revision: Phase 7 Implementation  |  Documentation date: 17 October 2026
+
+Table of contents
+1. Purpose and Architecture
+2. Workflow Architecture and Node Sequence
+3. Typed Workflow State and Data Contracts
+4. Conditional Edges, Failure Paths, and Fast-Fail Safeguards
+5. Retry and Idempotency Policies
+6. Integration Points with Phases 0-6
+7. Security Boundaries, Untrusted Telemetry, and Human-in-the-Loop Governance
+8. Example Workflow Execution Walkthrough
+9. Test Results, Verification Record, and Limitations
+10. Interview-Ready Explanation
+
+
+1. Purpose and Architecture
+ThreatFusion AI operates an agentic Security Operations Center (SOC) copilot pipeline:
+Ingestion (Phase 2) -> Normalization (Phase 3) -> Entity Resolution (Phase 4) -> Temporal Knowledge Graph Persistence (Phase 5) -> Triage and Investigation Engine (Phase 6) -> LangGraph Orchestration (Phase 7).
+
+Role of Phase 7 LangGraph Orchestration:
+In traditional security systems, ingestion, enrichment, and triage are often coupled together in brittle, monolithic scripts or ad-hoc background tasks. If a database is slow or a field is missing, entire worker queues can block or fail invisibly.
+Phase 7 integrates all previous modules into a structured, observable, and testable workflow powered by LangGraph. It provides:
+- Decoupled, single-responsibility nodes: Each stage of alert processing (Validation, Normalization, Resolution, Persistence, Investigation Context, Triage, Synthesis) is isolated.
+- Typed state dictionary (AlertWorkflowState): Passed deterministically across nodes without hidden mutable side effects.
+- Strict conditional branching: Invalid payloads fail fast, preventing wasted compute downstream.
+- Bounded retries and replay guards: Transient database errors are retried with strict limits, while already-persisted alerts are never duplicated.
+- Honest partial execution: If graph persistence or investigation context degrades, downstream triage still completes on available telemetry while explicitly recording the partial status and uncertainty in the final output.
+- No LLMs in the critical path: Triage, routing, and synthesis remain 100% deterministic and reproducible.
+
+
+2. Workflow Architecture and Node Sequence
+The workflow is implemented using LangGraph's StateGraph compiled into an asynchronous execution DAG.
+
+Node Sequence Overview:
+1. receive_alert (Node 1):
+   - Entry point for ingested raw alerts.
+   - Extracts or generates a unique alert_id.
+   - Preserves raw_alert and source_provenance throughout the workflow.
+   - Records start timestamp and initializes execution metadata.
+2. validate_input (Node 2):
+   - Validates that the input payload is a non-empty dictionary containing actual data.
+   - If validation fails, sets is_valid=False and branches directly to synthesize_final_result (fast-fail, no retry).
+3. normalize_alert (Node 3):
+   - Invokes OCSFNormalizer to convert the raw alert dictionary into a validated OCSFSecurityFinding model.
+   - If an AlertSchemaError or malformed data exception occurs, records normalization_error and branches directly to synthesize_final_result.
+4. resolve_entities (Node 4):
+   - Invokes EntityResolver to extract, canonicalize, and deduplicate entities (Asset, Identity, IOC, TTP, Incident) and temporal edges into a ResolutionResult.
+   - Captures any unresolved entities or resolution conflicts without crashing.
+5. persist_to_graph (Node 5, Async):
+   - If graph persistence is enabled and Neo4j is configured, persists nodes and relationships via Neo4jClient.persist_resolution_result.
+   - Enforces replay protection: if graph_persisted is already True, skips write.
+   - If transient GraphConnectionError or TimeoutError occurs, routes back for bounded retry (up to max_retries).
+   - If retries are exhausted or Neo4j is unavailable, marks stage as PARTIAL and moves forward without crashing.
+6. gather_investigation_context (Node 6, Async):
+   - Invokes InvestigationService to retrieve graph neighborhood and historical target counts.
+   - If Neo4j is down, gracefully degrades to telemetry-only empirical facts with graph_available=False.
+7. perform_triage (Node 7):
+   - Invokes AlertTriageEngine using the normalized finding, resolution result, and investigation context.
+   - Computes deterministic score (0-100), IncidentPriority (LOW, MEDIUM, HIGH, CRITICAL), contributing reasons, and advisory recommended next steps.
+8. synthesize_final_result (Node 8):
+   - Terminal node reached by all branches.
+   - Evaluates stage records to determine overall workflow status (COMPLETED, PARTIAL, or FAILED).
+   - Constructs an immutable AlertWorkflowOutput model containing the complete audit trail and duration metrics.
+
+
+3. Typed Workflow State and Data Contracts
+The workflow state is defined using Python's TypedDict (orchestrator/state.py) to provide static type enforcement with mypy while integrating natively with LangGraph:
+
+AlertWorkflowState Fields:
+- Input & Provenance:
+  * alert_id (str): Canonical or raw alert identifier.
+  * raw_alert (dict[str, Any]): Verbatim original alert payload (never mutated).
+  * source (str): Ingestion source (e.g., "wazuh").
+  * source_provenance (dict[str, Any]): Ingestion metadata (collector ID, index, received_at).
+  * received_at (float): Epoch timestamp of initial arrival.
+- Validation Stage:
+  * is_valid (bool): True if dictionary validation passed.
+  * validation_errors (list[str]): List of validation violation messages.
+- Normalization Stage:
+  * finding (OCSFSecurityFinding | None): Validated OCSF model.
+  * normalization_error (str | None): Error string if normalization failed.
+- Entity Resolution Stage:
+  * resolution (ResolutionResult | None): Deduplicated entities, edges, and conflicts.
+  * resolution_error (str | None): Error string if resolution failed.
+- Graph Persistence Stage:
+  * graph_persistence_enabled (bool): Configuration toggle.
+  * graph_persisted (bool): True if entities were successfully committed to Neo4j.
+  * persisted_nodes_count (int): Count of persisted graph nodes.
+  * persisted_edges_count (int): Count of persisted temporal edges.
+  * persistence_error (str | None): Error string if persistence failed.
+- Investigation Context Stage:
+  * investigation_context (InvestigationContext | None): Empirical facts and inferences.
+  * investigation_error (str | None): Error string if neighborhood lookup failed.
+- Triage Stage:
+  * triage_result (TriageResult | None): Structured priority assessment.
+  * triage_error (str | None): Error string if triage evaluation failed.
+- Execution Control & Auditing:
+  * workflow_status (str): Lifecycle status (PENDING, RUNNING, COMPLETED, PARTIAL, FAILED).
+  * current_stage (str): Currently executing node name.
+  * completed_stages (list[str]): Chronological sequence of executed stage names.
+  * stage_records (dict[str, dict[str, Any]]): StageRecord dictionaries with status, start/end timestamps, and duration_ms.
+  * retry_counts (dict[str, int]): Map of stage name to retry count.
+  * max_retries (int): Maximum retry limit for recoverable operations (default 2).
+  * retry_needed (bool): Transient flag triggering conditional retry loop.
+  * errors (list[str]): Aggregated pipeline error messages.
+  * started_at (float): Epoch timestamp when execution started.
+  * completed_at (float | None): Epoch timestamp when finalized.
+  * duration_ms (float): Total end-to-end execution latency in milliseconds.
+  * final_output (dict[str, Any] | None): Serialized AlertWorkflowOutput dictionary.
+
+
+4. Conditional Edges, Failure Paths, and Fast-Fail Safeguards
+All routing logic is concentrated in orchestrator/edges.py to maintain complete testability and separation from node execution:
+
+Branching Specifications:
+1. route_after_validation(state):
+   - Condition: if not state["is_valid"]
+   - Route -> synthesize_final_result (Bypasses normalization, resolution, persistence, and triage).
+   - Else -> normalize_alert.
+2. route_after_normalization(state):
+   - Condition: if state["finding"] is None
+   - Route -> synthesize_final_result (Bypasses resolution, persistence, and triage).
+   - Else -> resolve_entities.
+3. route_after_persistence(state):
+   - Condition: if state["retry_needed"] and retry_count <= max_retries
+   - Route -> persist_to_graph (Bounded retry loop).
+   - Else -> gather_investigation_context (Proceeds even if persistence failed or was skipped).
+
+Termination Guarantee:
+- Every conditional branch terminates at synthesize_final_result, which routes unconditionally to LangGraph's END node.
+- There are no unconstrained cycles or unbounded loops.
+
+
+5. Retry and Idempotency Policies
+Safe Retries:
+- Only operations with transient external dependencies (specifically Neo4j database network timeouts and connection resets) are eligible for retries.
+- Validation and schema normalization errors are deterministic; retrying them produces the exact same failure. They are never retried.
+- Retries are strictly bounded by max_retries (default: 2 attempts). When exhausted, the error is recorded, stage status is marked as PARTIAL, and execution continues forward.
+
+Idempotency and Replay Protection:
+- Replay Guard in State: If an alert workflow is re-run or retried from an intermediate checkpoint, persist_to_graph checks if state["graph_persisted"] is True. If so, it immediately marks the stage as SKIPPED and logs a message without re-writing to the database.
+- Idempotency in Neo4j Schema: Even if persistence is re-executed, Phase 5's Neo4j persistence layer uses parameterized Cypher MERGE queries with uniqueness constraints on canonical IDs (e.g., asset:agent:001, identity:user:admin@host). Properties are merged idempotently with confidence maximum-wins rules, preventing duplicate node or relationship creation.
+
+
+6. Integration Points with Phases 0-6
+The LangGraph orchestrator acts as the central conductor unifying all previous phases:
+- Phase 0 (core): Uses AppSettings for configuration, get_logger for structured logging, and adheres to strict production TLS rules.
+- Phase 1 & 2 (ingestion): Receives raw alerts ingested by WazuhClient and AlertPoller, preserving source provenance throughout.
+- Phase 3 (normalization): Uses OCSFNormalizer to convert raw alert dictionaries into typed OCSFSecurityFinding models.
+- Phase 4 (graph/resolver): Uses EntityResolver to extract canonical entity identifiers, temporal edges, and resolution conflicts.
+- Phase 5 (graph/client): Uses Neo4jClient to persist entities and temporal edges, and query graph neighborhoods.
+- Phase 6 (agents): Uses InvestigationService to retrieve empirical facts and inferences, and AlertTriageEngine to compute deterministic incident priority and advisory next steps.
+
+
+7. Security Boundaries, Untrusted Telemetry, and Human-in-the-Loop Governance
+Untrusted Input Defense:
+- Security telemetry (log lines, process names, command-line arguments, usernames) frequently contains adversarial strings (SQL injection, shell metacharacters, prompt injections).
+- ThreatFusion AI treats all incoming alert text strictly as passive data. No telemetry is evaluated with eval(), formatted into raw unparameterized Cypher queries, or passed to an unconstrained LLM prompt.
+- Even when payloads like "admin' OR '1'='1; --" are present, they are safely tokenized, stored, and quoted without triggering code execution.
+
+Advisory Action Safeguards:
+- The orchestrator produces recommendations (e.g., "Inspect active sessions for user root", "Isolate host web-server-01").
+- These recommendations are strictly advisory and explicitly flagged as requiring human SOC analyst confirmation before any disruptive containment action is taken.
+- The orchestrator does not implement automated host isolation, account locking, or firewall rule injection.
+
+
+8. Example Workflow Execution Walkthrough
+Input Scenario:
+A raw Wazuh alert reporting an SSH brute force attempt against host web-server-01 involving the "root" account from public IP 203.0.113.195.
+
+Execution Trace:
+1. receive_alert:
+   - Alert ID: "wazuh-alert-101"
+   - Source: "wazuh"
+   - Stage duration: 0.2ms -> SUCCESS
+2. validate_input:
+   - Verified dictionary structure and presence of rule telemetry.
+   - Stage duration: 0.1ms -> SUCCESS
+3. normalize_alert:
+   - Mapped to OCSFSecurityFinding (Class 2001, Severity High / Level 4).
+   - Extracted MITRE ATT&CK technique T1110 (Brute Force).
+   - Stage duration: 0.8ms -> SUCCESS
+4. resolve_entities:
+   - Resolved 4 entities: Asset (asset:agent:001), Identity (identity:user:root@global), IOC (ioc:ip:203.0.113.195), Incident (finding:wazuh-alert-101).
+   - Resolved 3 temporal edges (INVOLVES, AFFECTS, USES).
+   - Stage duration: 0.5ms -> SUCCESS
+5. persist_to_graph:
+   - Persisted nodes and edges to Neo4j knowledge graph via MERGE.
+   - Stage duration: 4.2ms -> SUCCESS
+6. gather_investigation_context:
+   - Retrieved graph neighborhood and prior alert history for asset web-server-01.
+   - Extracted 5 empirical facts and 1 analytical inference (privileged_account_targeted).
+   - Stage duration: 3.1ms -> SUCCESS
+7. perform_triage:
+   - Base score: 60 (High severity).
+   - Boosts: +15 (privileged user root).
+   - Score: 75/100 -> IncidentPriority.HIGH.
+   - Formulated 4 advisory containment recommendations.
+   - Stage duration: 0.4ms -> SUCCESS
+8. synthesize_final_result:
+   - Overall status: WorkflowStatus.COMPLETED.
+   - Total workflow duration: 9.3ms.
+   - Output: Immutable AlertWorkflowOutput record ready for audit logging or SOC presentation.
+
+
+9. Test Results, Verification Record, and Limitations
+Test Suite:
+- Orchestrator Tests: tests/unit/test_orchestration.py (13 dedicated unit tests).
+- Total Repository Tests: 202 tests passing across all packages.
+- Static Analysis: ruff check . passed with 0 errors; mypy passed strictly on all 38 source files.
+
+Coverage Matrix:
+Test Function | Component Tested | Result
+test_full_pipeline_success_with_mocked_graph | End-to-end execution through all 8 nodes | PASSED
+test_empty_alert_fails_validation | Empty dictionary input fails fast to finalization | PASSED
+test_non_dict_payload_fails_validation | Non-dict string/int payload fails validation safely | PASSED
+test_all_null_values_fails_validation | All-null payload dictionary fails validation | PASSED
+test_malformed_alert_normalization_fails_fast | Normalization error branches fast to synthesis | PASSED
+test_persistence_disabled_skips_cleanly | Graph persistence skipped when disabled, triage completes | PASSED
+test_graph_connection_error_exhausts_retries_and_continues | Connection timeout retried 2x, marks PARTIAL, continues | PASSED
+test_graph_replay_idempotency_guard | Already-persisted alerts skip redundant database writes | PASSED
+test_workflow_determinism_across_runs | Identical findings yield identical scores and outputs | PASSED
+test_malicious_telemetry_strings_handled_passively | SQLi and prompt injection strings handled safely as data | PASSED
+test_batch_processing_multiple_alerts | Batch processing executes sequential alerts cleanly | PASSED
+test_entity_resolver_exception_is_handled_gracefully | Resolver exception marked as PARTIAL without crashing | PASSED
+test_stage_metrics_and_records_captured | StageRecord captures duration_ms and timestamps per node | PASSED
+
+Known Limitations:
+- Graph persistence retry delay is currently linear; exponential backoff with jitter can be added when Redis distributed task queues are introduced.
+- Multi-agent LLM consensus reasoning (LangGraph multi-agent workflows with specialized persona agents) is deferred to future phases; Phase 7 provides the foundational deterministic pipeline upon which agentic reasoning loops will be mounted.
+
+
+10. Interview-Ready Explanation
+"In Phase 7, we built the LangGraph orchestration engine that integrates our ingestion, OCSF normalization, entity resolution, Neo4j temporal graph persistence, and deterministic triage into an observable, resilient workflow. Rather than a monolithic pipeline or an uncontrolled LLM loop, our workflow is modeled as a StateGraph with 8 discrete nodes and typed state contracts.
+We implemented strict conditional branching so invalid payloads fail fast, bounded retry policies for transient database timeouts, and an idempotency guard that prevents duplicate graph writes if a workflow is replayed. If Neo4j is offline, the workflow doesn't crash; it degrades honestly to a partial state, retaining all telemetry facts and allowing deterministic triage to assign incident priorities while transparently reporting the database uncertainty. Every branch is guaranteed to terminate, all telemetry strings are treated strictly as passive data, and recommendations remain advisory to guarantee human-in-the-loop SOC governance."
