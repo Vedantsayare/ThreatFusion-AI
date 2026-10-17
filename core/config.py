@@ -52,6 +52,10 @@ class AppSettings(BaseSettings):
     wazuh_verify_ssl: bool = True
     wazuh_poll_interval_seconds: int = Field(default=15, ge=5, le=3600)
     wazuh_timeout_seconds: int = Field(default=10, ge=1, le=120)
+    wazuh_alerts_endpoint: str = "/alerts"
+    wazuh_batch_size: int = Field(default=100, ge=1, le=1000)
+    wazuh_max_retries: int = Field(default=3, ge=1, le=10)
+    wazuh_retry_backoff_seconds: float = Field(default=1.0, ge=0.01, le=30.0)
 
     # ── PostgreSQL ───────────────────────────────────────────────────────────
     postgres_host: str = "localhost"
@@ -129,6 +133,14 @@ class AppSettings(BaseSettings):
             )
         return v
 
+    @field_validator("wazuh_alerts_endpoint")
+    @classmethod
+    def wazuh_alerts_endpoint_format(cls, v: str) -> str:
+        v = v.strip()
+        if not v.startswith("/"):
+            v = f"/{v}"
+        return v
+
     @field_validator("misp_url")
     @classmethod
     def misp_url_strip_trailing_slash(cls, v: str) -> str:
@@ -192,6 +204,10 @@ class AppSettings(BaseSettings):
             "wazuh_verify_ssl": self.wazuh_verify_ssl,
             "wazuh_poll_interval_seconds": self.wazuh_poll_interval_seconds,
             "wazuh_timeout_seconds": self.wazuh_timeout_seconds,
+            "wazuh_alerts_endpoint": self.wazuh_alerts_endpoint,
+            "wazuh_batch_size": self.wazuh_batch_size,
+            "wazuh_max_retries": self.wazuh_max_retries,
+            "wazuh_retry_backoff_seconds": self.wazuh_retry_backoff_seconds,
             "postgres_host": self.postgres_host,
             "postgres_port": self.postgres_port,
             "postgres_db": self.postgres_db,
