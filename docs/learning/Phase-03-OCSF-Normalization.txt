@@ -1,0 +1,197 @@
+ThreatFusion AI
+Phase 3: OCSF Alert Normalization
+Learning guide, implementation walkthrough, and validation record
+Source revision: Phase 3 Implementation  |  Documentation date: 17 October 2026
+
+Table of contents
+1. Project and Phase Overview
+2. Schema Decisions and OCSF Compliance Clarification
+3. Wazuh to OCSF Field Mapping Specification
+4. Handling Missing, Malformed, and Boundary Data
+5. Security, Untrusted Input, and Raw Data Preservation
+6. Code Architecture and Implementation Walkthrough
+7. Test Strategy and Verification Results
+8. Limitations and Downstream Integration
+9. Interview-Ready Narrative
+10. Glossary
+11. Completion Checklist and Validation Record
+
+
+1. Project and Phase Overview
+ThreatFusion AI operates an agentic Security Operations Center (SOC) copilot pipeline: Ingestion -> Normalization -> Triage -> Investigation -> Correlation -> Guardrail. Telemetry is captured upstream from Wazuh security monitors.
+
+Purpose and scope of Phase 3
+Raw security alerts emitted by Wazuh arrive as heterogeneous JSON dictionaries with vendor-specific hierarchies (e.g. data.srcip, rule.level, agent.name). Downstream AI agents and graph correlation engines require a standardized, consistent data model. Phase 3 implements deterministic alert normalization converting raw Wazuh alert dictionaries into a strongly validated, typed data structure based on the Open Cybersecurity Schema Framework (OCSF).
+
+Implemented in Phase 3
+- Dedicated normalization module under normalization/ (models.py, normalizer.py, __init__.py).
+- Pydantic v2 data models defining a project-specific subset of OCSF v1.1.0 Security Finding (Class UID 2001, Category UID 2: Findings).
+- Deterministic severity mapping converting Wazuh rule levels (0-16) to standard OCSF severity IDs (0-6) and names.
+- Timestamp parsing supporting ISO 8601 strings (UTC, timezone offsets, +0000, Z) and epoch numeric timestamps, with safe fallback.
+- Contextual entity extraction for device (agent/manager), source and destination network endpoints (IP, port, protocol), user accounts, and MITRE ATT&CK tactics/techniques.
+- Missing field handling with deterministic SHA-256 composite fallback IDs for alerts missing native identifiers.
+- Untrusted input isolation: alerts are treated strictly as passive data without eval() or string interpolation; raw_data retains the original dictionary untouched.
+- Batch normalization supporting both raw list inputs and Phase 2 RawAlertBatch objects, with configurable malformed-record skipping.
+- 44 comprehensive unit tests verifying normal alerts, missing attributes, malformed timestamps, port boundaries, attacks, and untrusted payloads.
+
+Deferred to future phases
+- Entity resolution and deduplication across multiple disparate telemetry sources (Phase 4).
+- Temporal knowledge graph ingestion into Neo4j (Phase 5).
+- Redis Streams persistence and queuing.
+- Autonomous LLM multi-agent triage, investigation, and enrichment.
+
+
+2. Schema Decisions and OCSF Compliance Clarification
+Crucial distinction: Strict OCSF compliance vs Project-Specific OCSF Subset
+The Open Cybersecurity Schema Framework (OCSF) is an extensible industry standard defining hundreds of event classes, profiles, and attributes. Full, strict OCSF compliance requires implementing exhaustive dictionaries and profile requirements (such as cloud resources, compliance benchmarks, and OS-specific kernel telemetry) that are neither provided by nor applicable to standard Wazuh alerts.
+
+ThreatFusion AI explicitly implements a Project-Specific OCSF-Style Subset:
+- Schema Version: 1.1.0
+- Event Category: Findings (category_uid: 2, category_name: "Findings")
+- Event Class: Security Finding (class_uid: 2001, class_name: "Security Finding")
+- Activity: Create (activity_id: 1, activity_name: "Create")
+- Metadata Schema Descriptor: "project_ocsf_subset" (explicitly declared in metadata.schema_name)
+- Profiles Applied: ["security_control"]
+
+This architecture provides the syntactic and semantic consistency of OCSF without incurring the overhead of unused schema attributes.
+
+
+3. Wazuh to OCSF Field Mapping Specification
+The normalization module maps vendor-specific Wazuh attributes to canonical OCSF attributes based strictly on available data:
+
+Wazuh Source Attribute | OCSF Target Field | Transformation / Notes
+id / _id | finding_info.uid | Direct string; fallback to comp-<sha256> if missing
+timestamp | time / metadata.original_time | Epoch milliseconds (time); original string preserved in metadata
+rule.level (0-16) | severity_id / severity | 0-3: Informational (1), 4-6: Low (2), 7-9: Medium (3), 10-12: High (4), 13-16: Critical (5), Invalid: Unknown (0)
+rule.description | finding_info.title | Summary title of the finding
+full_log | finding_info.desc / message | Detailed log line; fallback to rule.description
+rule.groups | finding_info.types | List of category/group strings (e.g. syslog, sshd, auth_failure)
+location | finding_info.src_url / unmapped | File or socket path where event was captured
+agent (id, name, ip) | device (uid, name, ip) | Device entity; fallback to manager if agent is absent
+data.srcip / srcip | src_endpoint.ip | Source IP address string
+data.srcport / srcport | src_endpoint.port | Source port validated to integer range 1-65535
+data.dstip / dstip | dst_endpoint.ip | Destination IP address string
+data.dstport / dstport | dst_endpoint.port | Destination port validated to integer range 1-65535
+data.protocol | src/dst_endpoint.protocol_name | Network protocol (e.g. ssh, tcp, udp)
+data.dstuser / srcuser / user | user.name | User account involved in security event
+rule.mitre (id, tactic, tech) | attacks[].technique / tactic | MITRE ATT&CK technique (uid, name) and tactic (name)
+decoder, cluster, syscheck | unmapped | Retained in unmapped dictionary for investigative context
+Entire Alert Dictionary | raw_data | Complete, unmutated raw alert dictionary preserved verbatim
+
+
+4. Handling Missing, Malformed, and Boundary Data
+A core design requirement is absolute determinism: normalization must never invent missing values, crash on invalid inputs, or silently drop data.
+
+Missing value discipline
+- Missing fields result in None (or an empty list for collections).
+- The normalizer never invents dummy IP addresses (e.g. 0.0.0.0 or 127.0.0.1) or placeholder users when attributes are missing.
+- Endpoints (src_endpoint, dst_endpoint) are instantiated only if at least one of IP or port is present.
+- If agent and manager are both omitted, device evaluates to None.
+
+Timestamp resilience
+- Wazuh produces varied timestamp formats across agents and modules: ISO 8601 with trailing Z, offset notations (+00:00, +0000, +05:30), and raw epoch seconds or milliseconds.
+- OCSFNormalizer normalizes ISO strings using datetime.fromisoformat with UTC fallback.
+- If a timestamp is completely corrupted (e.g. "corrupt-date") or omitted, the normalizer does not crash: it assigns the current epoch timestamp, records the raw string in metadata.original_time, and flags the anomaly in unmapped["timestamp_warning"].
+
+Severity mapping boundaries
+- Wazuh levels range from 0 to 16.
+- Inputs outside this range (-1, 999, non-numeric strings, None) safely evaluate to severity_id: 0 ("Unknown").
+
+Port validation
+- Raw ports supplied as string integers (e.g. "45123") are converted to integers.
+- Out-of-bounds ports (<= 0, > 65535) or non-numeric strings ("not-a-port") are ignored and set to None without aborting the normalization pipeline.
+
+Deterministic composite ID fallback
+- When an alert lacks an id or _id, a deterministic fallback ID is generated:
+  seed = f"{timestamp}|{rule_id}|{agent_id}"
+  uid = f"comp-{sha256(seed)[:16]}"
+- Identical raw alerts consistently yield the same composite UID across independent runs, ensuring idempotency.
+
+
+5. Security, Untrusted Input, and Raw Data Preservation
+External security telemetry is intrinsically untrusted and may contain hostile content submitted by adversaries.
+
+Security protections
+- No code execution: Alert attributes (such as rule descriptions, usernames, or full logs) may contain malicious strings (SQL injection fragments, XSS tags, or bash shellcode). Normalization treats all fields strictly as passive string or numerical values. No eval(), exec(), or template compilation is executed.
+- No LLM dependency: Normalization is completely deterministic and runs offline without calling language models.
+- Credential safety: No credentials or authentication tokens are received or generated during normalization.
+- Raw data preservation: The untouched raw alert is preserved in OCSFSecurityFinding.raw_data. Analysts or downstream correlation engines can always inspect the ground truth telemetry.
+
+
+6. Code Architecture and Implementation Walkthrough
+The normalization subsystem consists of:
+
+normalization/models.py
+- OCSFBaseModel: Base Pydantic v2 model configuring extra="ignore" and validate_assignment=True.
+- OCSFSecurityFinding: The primary event model implementing Category 2, Class 2001.
+- Nested models: OCSFMetadata, OCSFProduct, OCSFFindingInfo, OCSFDevice, OCSFEndpoint, OCSFUser, OCSFAttack, OCSFTactic, OCSFTechnique.
+
+normalization/normalizer.py
+- NormalizationError / AlertSchemaError: Typed exceptions for schema violations.
+- OCSFNormalizer: The main normalization engine providing:
+  - normalize(raw_alert: dict[str, Any]) -> OCSFSecurityFinding
+  - normalize_batch(batch: Any, skip_malformed: bool = True) -> list[OCSFSecurityFinding]
+  - Internal extraction helpers for timestamps, severities, devices, endpoints, users, attacks, and unmapped attributes.
+
+normalization/__init__.py
+- Exports the public interface: OCSFSecurityFinding, OCSFNormalizer, AlertSchemaError, NormalizationError, and constituent models.
+
+
+7. Test Strategy and Verification Results
+A rigorous unit test suite was implemented in tests/unit/test_normalization.py covering 44 test cases across 6 test classes:
+
+Test Class | Verifications Performed
+TestOCSFNormalAlert | Complete alert with rule, mitre, agent, endpoints, user, full_log; validates all OCSF fields
+TestOCSFMissingFields | Fallback to manager when agent is absent; None device when both absent; missing rule/severity; missing endpoints/user; deterministic composite ID generation
+TestOCSFTimestampHandling | Numeric seconds, numeric milliseconds, ISO with Z, ISO with offset, malformed string fallback, missing timestamp fallback
+TestOCSFValueValidationAndRobustness | Parameterized Wazuh levels 0-16 + out-of-range/invalid levels; invalid ports (-1, 0, 65536, strings); single-string vs list MITRE structures; non-dict raw alert schema errors
+TestOCSFUntrustedInputAndPreservation | Shellcode, SQLi, and XSS strings preserved verbatim without execution; raw_data fidelity
+TestOCSFBatchNormalization | Normalizing lists; normalizing RawAlertBatch instances; skipping malformed items; fail-fast validation on non-dict items
+
+Verification summary:
+- pytest tests/unit/test_normalization.py: 44 passed in 0.37s
+- Full test suite (pytest -v): 137 passed in 1.48s (44 normalization + 20 poller + 18 wazuh_client + 39 config + 16 health)
+- Ruff linter: All checks passed (0 errors, 0 warnings)
+- Mypy static type checker (strict mode): Success, no issues found in 19 source files
+
+
+8. Limitations and Downstream Integration
+Scope boundaries
+- Entity resolution is not performed in this phase; IP addresses and hostnames are not yet correlated to persistent network assets.
+- Persistence is not performed in this phase; events are not yet written to Neo4j, PostgreSQL, or Redis Streams.
+- Threat intelligence enrichment (MISP IoC matching) is deferred to future correlation phases.
+
+Preparedness for Phase 4 & Phase 5
+The normalized OCSFSecurityFinding model provides clean, strongly typed properties:
+- finding.device and finding.src_endpoint / finding.dst_endpoint directly feed graph node creation (Device, IP, Port).
+- finding.user feeds identity resolution (Account, User).
+- finding.attacks feeds MITRE ATT&CK node linking.
+- finding.raw_data ensures complete auditability.
+
+
+9. Interview-Ready Narrative
+"In Phase 3 of ThreatFusion AI, I designed and implemented the OCSF alert normalization module that transforms raw, heterogeneous Wazuh telemetry into a structured, validated internal event model. We adopted the Open Cybersecurity Schema Framework v1.1.0 Security Finding (Class 2001) as our canonical schema. To maintain engineering honesty and precision, I explicitly documented our implementation as a project-specific OCSF subset rather than claiming full, exhaustive OCSF compliance, since standard host-based alerts only populate a focused subset of OCSF's hundreds of attributes.
+
+The normalizer is completely deterministic, running without external network dependencies or LLM calls. It extracts security severity by mapping Wazuh's 0-16 levels into standard OCSF severities, parses complex ISO and numeric timestamps with safe fallback, isolates source and destination endpoints while validating ports against the 1-65535 range, and resolves MITRE ATT&CK tactics and techniques. 
+
+A critical architectural priority was robustness against adversarial or untrusted input: alert data is treated strictly as passive dictionaries, preventing code injection, and the original raw alert is preserved verbatim alongside unmapped vendor attributes for forensic auditability. If an alert arrives without an identifier, the normalizer deterministically synthesizes a SHA-256 composite ID to guarantee idempotent processing. The module is fully tested with 44 unit tests, brings our test suite to 137 passing tests, and passes strict Mypy and Ruff validation."
+
+
+10. Glossary
+- OCSF: Open Cybersecurity Schema Framework; an open-source specification providing common taxonomy and schema for security telemetry.
+- Security Finding (Class 2001): The OCSF class dedicated to security events, anomalies, and detections generated by security controls.
+- Severity ID: OCSF standardized severity scale ranging from 0 (Unknown) to 5 (Critical) and 6 (Fatal).
+- Normalization: The process of transforming data from various formats into a common, standardized data model.
+- High Watermark: A cursor or timestamp used in ingestion pipelines to prevent reprocessing historical events.
+- Idempotency: The property of an operation whereby performing it multiple times produces the exact same result as performing it once.
+- MITRE ATT&CK: A globally accessible knowledge base of adversary tactics, techniques, and procedures (TTPs).
+
+
+11. Completion Checklist and Validation Record
+[TABLE 1: VERIFIED COMMAND OUTPUTS]
+Check | Command | Result | Details
+Normalization Tests | pytest tests/unit/test_normalization.py | Passed (44/44) | All Phase 3 normalization unit tests passed in 0.37s
+Full Test Suite | pytest | Passed (137/137) | Complete repository unit test suite passing in 1.48s
+Linter | ruff check . | Passed | 0 errors, 0 warnings across all files
+Type Checker | mypy core ingestion normalization tests | Passed | Success: 0 issues in 19 source files
+End of Phase 3 Learning Guide.
