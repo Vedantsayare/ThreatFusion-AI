@@ -1,29 +1,45 @@
 # ThreatFusion AI — Docker Compose (Phase 0 infrastructure services)
 #
-# Services: PostgreSQL 16, Redis 7, Neo4j 5 Community
-# All credentials are loaded from the .env file — never hard-coded here.
-# Data volumes are stored under ./docker-data/ which is listed in .gitignore.
+# Services: PostgreSQL 16.4, Redis 7.4, Neo4j 5.24 Community
+#
+# SECURITY RULES:
+#   1. All credentials are read from .env — never hard-coded here.
+#   2. All required credentials use ${VAR:?msg} syntax — Compose exits with
+#      an error if the variable is absent or empty (fail-closed behaviour).
+#   3. All database ports are bound to 127.0.0.1 by default so they are not
+#      reachable from outside the host. Override with NEO4J_HTTP_HOST_PORT etc.
+#      if you need LAN access in a trusted dev environment.
+#   4. Image tags are pinned to specific minor versions. To update, change the
+#      tag here, pull, verify with `docker compose up`, then commit the change.
+#
+# UPDATING IMAGE VERSIONS:
+#   1. Change the version tag below (e.g. 16.4 → 16.5).
+#   2. Run: docker compose pull
+#   3. Smoke-test with: docker compose up -d && docker compose ps
+#   4. Commit both docker-compose.yml and the updated .env.example if relevant.
 #
 # Usage:
 #   docker compose up -d          Start all services in the background
-#   docker compose ps              Check container status
+#   docker compose ps              Check container status and health
 #   docker compose logs -f         Follow all logs
-#   docker compose down            Stop and remove containers (data persists in volumes)
-#   docker compose down -v         Stop and DESTROY data volumes (destructive)
+#   docker compose down            Stop containers (data persists in volumes)
+#   docker compose down -v         Stop AND destroy data volumes (destructive!)
 
 services:
 
-  # ── PostgreSQL 16 ─────────────────────────────────────────────────────────
+  # ── PostgreSQL 16.4 ───────────────────────────────────────────────────────
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16.4-alpine
     container_name: tf_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: "${POSTGRES_DB:-threatfusion}"
-      POSTGRES_USER: "${POSTGRES_USER:-threatfusion_user}"
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"   # must be set in .env
+      POSTGRES_DB:       "${POSTGRES_DB:-threatfusion}"
+      POSTGRES_USER:     "${POSTGRES_USER:-threatfusion_user}"
+      # :?msg — Compose aborts startup if this variable is absent or empty.
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}"
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      # Bound to localhost only — not reachable from the network.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -33,45 +49,53 @@ services:
       retries: 5
       start_period: 15s
 
-  # ── Redis 7 ───────────────────────────────────────────────────────────────
+  # ── Redis 7.4 ─────────────────────────────────────────────────────────────
   redis:
-    image: redis:7-alpine
+    image: redis:7.4-alpine
     container_name: tf_redis
     restart: unless-stopped
-    # Require password; enable persistence via AOF so the stream survives restart
+    # Password required; AOF persistence keeps streams alive across restarts.
+    # :?msg — Compose aborts startup if REDIS_PASSWORD is absent or empty.
     command: >
       redis-server
-      --requirepass "${REDIS_PASSWORD}"
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}
       --appendonly yes
       --appendfsync everysec
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      # Bound to localhost only.
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      # REDISCLI_AUTH avoids printing the password in the process table.
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
+    environment:
+      # Expose the password as an env var so the healthcheck shell can read it.
+      REDIS_PASSWORD: "${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}"
 
-  # ── Neo4j 5 Community Edition ─────────────────────────────────────────────
+  # ── Neo4j 5.24 Community Edition ──────────────────────────────────────────
   neo4j:
-    image: neo4j:5-community
+    image: neo4j:5.24-community
     container_name: tf_neo4j
     restart: unless-stopped
     environment:
-      NEO4J_AUTH: "${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD}"
-      # Memory limits — adjust if host RAM is constrained
+      # :?msg — Compose aborts startup if NEO4J_PASSWORD is absent or empty.
+      NEO4J_AUTH: "${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set in .env}"
+      # Memory limits — reduce if host RAM is constrained (e.g. 256m/512m).
       NEO4J_server_memory_heap_initial__size: "512m"
       NEO4J_server_memory_heap_max__size: "1G"
       NEO4J_server_memory_pagecache_size: "512m"
-      # Allow connections from any interface inside Docker network
+      # Listen on all internal interfaces so other containers can reach Neo4j.
       NEO4J_dbms_connector_bolt_listen__address: "0.0.0.0:7687"
       NEO4J_dbms_connector_http_listen__address: "0.0.0.0:7474"
     ports:
-      - "7474:7474"   # Neo4j Browser (HTTP)
-      - "7687:7687"   # Bolt protocol
+      # Both ports bound to localhost only.
+      - "127.0.0.1:${NEO4J_HTTP_HOST_PORT:-7474}:7474"
+      - "127.0.0.1:${NEO4J_BOLT_HOST_PORT:-7687}:7687"
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
@@ -80,7 +104,7 @@ services:
       interval: 15s
       timeout: 10s
       retries: 10
-      start_period: 60s   # Neo4j JVM takes longer to start
+      start_period: 60s   # Neo4j JVM startup takes ~30–60 s
 
 volumes:
   postgres_data:

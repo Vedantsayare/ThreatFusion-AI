@@ -77,7 +77,24 @@ class TestSystemHealth:
         assert len(d["services"]) == 1
         assert d["services"][0]["name"] == "postgres"
 
-    def test_empty_services_list_returns_ok(self) -> None:
-        """Edge case: no monitored services → healthy by default."""
+    def test_empty_services_list_returns_unknown(self) -> None:
+        """Edge case: no probes registered → UNKNOWN, not OK.
+
+        A health-check system that has not registered any probes cannot
+        assert readiness; returning OK would be a false positive.
+        """
         system = SystemHealth([])
+        assert system.overall == ServiceStatus.UNKNOWN
+
+    def test_single_unknown_service_reports_degraded(self) -> None:
+        """A lone UNKNOWN probe rolls up to DEGRADED, not to OK."""
+        system = SystemHealth([ServiceHealth("neo4j", ServiceStatus.UNKNOWN, "not probed")])
+        assert system.overall == ServiceStatus.DEGRADED
+
+    def test_multiple_ok_services_report_ok(self) -> None:
+        """All-OK probes → overall OK (regression guard)."""
+        system = SystemHealth([
+            ServiceHealth("postgres", ServiceStatus.OK),
+            ServiceHealth("redis", ServiceStatus.OK),
+        ])
         assert system.overall == ServiceStatus.OK

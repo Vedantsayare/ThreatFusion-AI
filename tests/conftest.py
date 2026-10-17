@@ -8,7 +8,7 @@ Secrets use obvious placeholder values; tests never connect to live services.
 
 from __future__ import annotations
 
-import os
+import os  # noqa: F401  (kept for future direct os.environ usage in tests)
 
 import pytest
 

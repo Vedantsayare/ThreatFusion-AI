@@ -73,5 +73,11 @@ def configure_logging() -> None:
 
 
 def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
-    """Return a named structlog logger."""
-    return structlog.get_logger(name)
+    """Return a named structlog logger.
+
+    structlog.get_logger() is typed as Any; the cast satisfies
+    mypy strict mode without altering runtime behaviour.
+    """
+    from typing import cast
+
+    return cast(structlog.stdlib.BoundLogger, structlog.get_logger(name))

@@ -55,17 +55,42 @@ dev = [
     "mypy>=1.10.0",
 ]
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Explicit package discovery.
+#  Without this, setuptools in flat-layout mode refuses to build when it
+#  detects multiple top-level Python directories.
+#  dashboard/ is a React app (not a Python package) — excluded.
+#  tests/, docs/, scripts/ are dev-only — excluded from the installed package.
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.setuptools.packages.find]
+include = [
+    "agents*",
+    "api*",
+    "core*",
+    "graph*",
+    "ingestion*",
+    "normalization*",
+    "orchestrator*",
+    "simulation*",
+]
+exclude = ["dashboard*", "tests*", "docs*", "scripts*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 # Never treat a skipped test as a pass — each skip must have an explicit reason.
 addopts = "-v --tb=short"
+markers = [
+    "integration: marks tests that require live Docker services (deselect with -m 'not integration')",
+]
 
 [tool.ruff]
 target-version = "py312"
 line-length = 100
+
+[tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "PT"]
-ignore = ["E501"]   # handled by formatter
+ignore = ["E501", "UP042"]  # E501 handled by formatter; UP042 StrEnum needs careful migration
 
 [tool.mypy]
 python_version = "3.12"

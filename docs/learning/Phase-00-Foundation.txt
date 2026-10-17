@@ -1,0 +1,296 @@
+ThreatFusion AI
+Phase 0: Foundation
+Technical learning guide, implementation walkthrough, and independent review
+Reviewed revision: 0c20600  |  Review date: 17 October 2026
+Table of contents
+
+In Microsoft Word, right-click the field and choose Update Field to populate page numbers.
+1. Phase purpose and requirements
+
+Phase 0 establishes the executable foundation for an agentic SOC copilot. It does not yet ingest alerts, create graph relationships, run agents, or expose a FastAPI endpoint. Instead, it defines the contracts that later phases will rely on: validated configuration, local persistence services, structured logging, a health-result model, a test harness, and an architecture record.
+What Phase 0 is responsible for
+
+Provide a Python 3.12 project with installable runtime and development dependencies.
+Load settings from environment variables using Pydantic Settings and validate important values at startup.
+Prepare PostgreSQL, Redis, and Neo4j Community Edition through Docker Compose.
+Provide structured JSON logging through structlog and the standard logging package.
+Define pure in-memory service-health aggregation without opening live connections.
+Provide unit tests that run without live infrastructure.
+Record non-obvious infrastructure decisions in docs/adr/0000-infrastructure-baseline.md.
+Hard constraints carried into later phases
+
+Free/open-source tooling only.
+Secrets belong in .env and must not be committed.
+The guardrail is a deterministic policy engine, not an LLM judgment.
+Every graph edge must later carry valid_from, valid_to, confidence, and source.
+Missing threat intelligence is unknown/no corroborating evidence, never confirmed safe.
+Every autonomous action requires human approval.
+These constraints are documented in the project context and README, but most are future-phase contracts rather than Phase 0 runtime enforcement.
+2. Architecture and design decisions
+
+The baseline is intentionally layered. Configuration and logging sit in core/, infrastructure is described declaratively in Docker Compose, and the empty package directories reserve boundaries for future ingestion, normalization, graph, agents, orchestration, API, and simulation work.
+Why the health model has no I/O
+
+core/health.py only represents results. Individual PostgreSQL, Redis, Neo4j, Wazuh, and MISP clients are deferred to later phases. This separation makes aggregation logic testable without requiring Docker, credentials, network access, or a running service.
+3. Project directory structure and important files
+
+ThreatFusion-AI/
+├── agents/              Future triage, investigation, correlation, guardrail agents
+├── api/                 Future FastAPI application
+├── core/                Configuration, logging, health models
+│   ├── config.py
+│   ├── health.py
+│   └── logger.py
+├── dashboard/           Future React/Vite/Cytoscape UI
+├── docs/adr/             Architecture Decision Records
+├── graph/                Future Neo4j schema and query layer
+├── ingestion/            Future Wazuh ingestion
+├── normalization/       Future OCSF mapping and entity resolution
+├── orchestrator/         Future LangGraph workflow
+├── simulation/           Future synthetic attack scenarios
+├── tests/
+│   ├── conftest.py
+│   └── unit/
+│       ├── test_config.py
+│       └── test_health.py
+├── .env.example          Safe configuration template
+├── docker-compose.yml    PostgreSQL, Redis, Neo4j services
+├── pyproject.toml        Package metadata and tool configuration
+└── README.md             Windows setup, phases, and constraints
+4. Dependencies, configuration, and environment variables
+
+pyproject.toml declares FastAPI/uvicorn, Pydantic, asyncpg and SQLAlchemy, Alembic, Neo4j, Redis, httpx, LangGraph, langchain-core, and structlog. Development extras declare pytest, pytest-asyncio, pytest-mock, pytest-cov, Ruff, and mypy. The installed local virtual environment contains pytest and its plugins; Ruff and mypy were not installed during this review.
+Secrets are marked repr=False for several Pydantic fields and omitted from safe_summary(). The computed postgres_dsn and redis_url intentionally contain credentials for client use; they must never be logged.
+Actual pattern from core/config.py
+@property
+def postgres_dsn(self) -> str:
+    """Async-compatible DSN using asyncpg driver."""
+    return (
+        f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
+        f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+    )
+Actual production placeholder guard, condensed only for page readability
+@model_validator(mode="after")
+def warn_non_production_defaults(self) -> "AppSettings":
+    placeholders = {"CHANGE_ME", "REPLACE_WITH", "your-secret"}
+    if self.app_env == "production":
+        for field_name in ("secret_key", "postgres_password",
+                           "neo4j_password", "redis_password"):
+            value = getattr(self, field_name)
+            if any(p in value for p in placeholders):
+                raise ValueError("Field contains a placeholder value")
+    return self
+5. Implementation walkthrough
+
+5.1 Settings lifecycle
+
+AppSettings reads .env and process environment variables through BaseSettings. Required fields without defaults fail validation. Literal types restrict app_env, log_level, and llm_provider. Field validators enforce Wazuh HTTPS and accepted Neo4j schemes. get_settings() wraps construction in lru_cache(maxsize=1), creating a process-local singleton.
+@lru_cache(maxsize=1)
+def get_settings() -> AppSettings:
+    """Return the cached singleton settings instance."""
+    return AppSettings()
+5.2 Health aggregation
+
+@property
+def overall(self) -> ServiceStatus:
+    statuses = {s.status for s in self._services}
+    if ServiceStatus.DOWN in statuses:
+        return ServiceStatus.DOWN
+    if ServiceStatus.DEGRADED in statuses or ServiceStatus.UNKNOWN in statuses:
+        return ServiceStatus.DEGRADED
+    return ServiceStatus.OK
+The precedence is deterministic: DOWN dominates; otherwise DEGRADED or UNKNOWN produces DEGRADED; otherwise the result is OK. The current implementation returns OK for an empty service list. That behavior is tested, but it is a review finding because an empty readiness check can become a false-positive health signal.
+5.3 Structured logging
+
+configure_logging() resolves the configured log level, configures the stdlib root logger to stdout, configures structlog processors for context, logger name, level, timestamp, stack information, and exception information, then attaches a JSON ProcessorFormatter. The function replaces root handlers, so repeated configuration behavior should be tested before using it in a larger application.
+6. Component interactions and data flow
+
+Process startup
+    │
+    ├─ AppSettings reads .env / environment variables
+    │      └─ validation failure stops startup
+    │
+    ├─ configure_logging()
+    │      └─ JSON events -> stdout
+    │
+    ├─ Docker Compose provides PostgreSQL, Redis, Neo4j
+    │      ├─ PostgreSQL: relational alerts, audit, approvals (planned)
+    │      ├─ Redis: cache and Streams (planned)
+    │      └─ Neo4j: temporal security graph (planned)
+    │
+    └─ health clients (future) -> ServiceHealth
+           └─ SystemHealth -> future /health endpoint
+The Phase 0 data flow is mostly a contract flow, not a live alert flow. Wazuh and MISP URLs and credentials are configured now, but no Wazuh poller, MISP client, PostgreSQL schema, Neo4j query layer, FastAPI route, or LangGraph graph is implemented in this revision.
+7. Windows setup and execution commands
+
+cd D:\Project\ThreatFusion-AI
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -e ".[dev]"
+Copy-Item .env.example .env
+notepad .env  # replace placeholders locally; do not commit .env
+docker compose up -d
+docker compose ps
+pytest
+Useful focused commands:
+# Unit tests only
+.\.venv\Scripts\python.exe -m pytest tests\unit\ -q
+
+# Coverage (requires pytest-cov)
+.\.venv\Scripts\python.exe -m pytest tests\unit\ --cov=core --cov-report=term-missing
+
+# Compose configuration validation
+docker compose config --quiet
+The README advises waiting roughly 60 seconds for Neo4j JVM startup and checking that all three services are healthy. No Docker service startup was performed in this review, so that integration behavior remains unverified.
+8. Testing methodology and actual results
+
+The unit tests deliberately avoid live services. tests/conftest.py injects a complete test environment with monkeypatch, clears get_settings()'s lru_cache before and after each test, and lets each test operate deterministically.
+What the tests cover
+
+Environment loading and typed defaults.
+Wazuh HTTPS and Neo4j scheme validation.
+Minimum secret-key length and invalid enum values.
+Production rejection of selected placeholder values.
+Computed DSN/Redis URL shape.
+Safe-summary omission of secret keys and obvious test values.
+Health status values and DOWN/DEGRADED precedence.
+Cached settings identity.
+What passing tests do not prove
+
+That PostgreSQL, Redis, or Neo4j starts or accepts connections.
+That Wazuh/MISP TLS verification is enforced by future clients.
+That logging emits valid JSON without duplicate records.
+That connection URLs work with reserved characters in credentials.
+That Ruff and mypy pass.
+9. Errors, debugging decisions, and known limitations
+
+During review, the globally available pytest, Ruff, and mypy commands were not found. The repository virtual environment supplied pytest, so tests were rerun with its explicit interpreter and passed. Ruff and mypy were absent from that environment; their results are recorded as unavailable, not as failures or passes.
+Compose validation emitted warnings that POSTGRES_PASSWORD, REDIS_PASSWORD, and NEO4J_PASSWORD were unset and defaulted to blank strings, yet returned success. This is a concrete fail-open configuration defect, not an invented integration result.
+Independent review findings
+
+No separate Gemini findings document was present in the repository, so there was no report to mechanically compare. The following findings were independently verified against source and command output.
+10. Security considerations and improvements
+
+Current positive controls
+
+The .gitignore excludes .env, secrets/, certificates, keys, and local data directories.
+Pydantic secret fields use repr=False and safe_summary() omits secret fields.
+Wazuh URLs are required to use HTTPS.
+Neo4j schemes are restricted to expected schemes.
+Production rejects selected placeholder values.
+The project documents that external text must not directly trigger actions and that human approval is required.
+Required hardening
+
+Make Docker Compose fail closed with required-variable interpolation for every credential.
+Default Wazuh and MISP certificate verification to true; allow insecure development opt-out only with explicit environment gating.
+Avoid logging postgres_dsn or redis_url because they contain credentials.
+Encode connection URL components so legitimate complex passwords work safely.
+Bind local development ports to 127.0.0.1 and document that the Compose file is not a production boundary.
+Pin container versions and add CI checks for dependency, image, and configuration changes.
+Add tests for credential placeholders across every API-key/password field, not only four fields.
+No committed real password, token, or private key was identified in the reviewed tracked files. That does not prove that secrets are absent from all Git history or untracked files.
+11. Interview-ready explanation
+
+"In Phase 0 I built the foundation for ThreatFusion AI rather than prematurely implementing the agents. I defined a typed AppSettings model backed by environment variables, so invalid URLs, enum values, ports, intervals, and short secrets fail at startup. I added a cached settings accessor and a redacted safe_summary for operational visibility. For infrastructure, Docker Compose provisions PostgreSQL for relational and audit data, Redis for Streams and caching, and Neo4j Community for the temporal security graph. I kept health aggregation pure and dependency-free: individual clients will report ServiceHealth, and SystemHealth deterministically prioritizes DOWN over DEGRADED or UNKNOWN. I also configured JSON logging with structlog and created pytest fixtures that isolate environment variables and clear the settings cache. The local unit suite has 31 passing tests, but I would not claim integration readiness: Docker services were not started, Ruff and mypy were unavailable, and the review found that Compose should fail closed on missing credentials and TLS verification should default to enabled."
+Likely follow-up questions
+
+12. Glossary
+
+13. Completion checklist
+
+Documentation gaps
+
+This guide documents only behavior visible in the Phase 0 revision. It does not claim that future clients, agents, graph constraints, human approval, or integrations exist. The table of contents is a Word field and may require an explicit Update Field action after opening. Integration and static-analysis results remain unavailable until the relevant tools and services are run.
+End of Phase 0 learning guide
+
+[TABLE 1]
+Purpose of this guide: explain what Phase 0 actually implements, why the choices were made, how to run and test it, and which items remain incomplete or unverified. This document does not mark the phase complete merely because the document exists.
+
+
+[TABLE 2]
+Decision | Choice | Why it was chosen | Trade-off
+Relational persistence | PostgreSQL 16 | ACID behavior, asyncpg/SQLAlchemy support, JSONB, and a mature audit ecosystem. | A database server must be operated and migrated.
+Streams/cache | Redis 7 with Streams and AOF | Ordered consumer-group delivery with less operational complexity than Kafka/RabbitMQ at this scale. | Redis persistence and delivery semantics must be designed carefully later.
+Knowledge graph | Neo4j 5 Community | Open-source-compatible graph database for temporal security relationships. | Community Edition lacks some enterprise availability and multi-database features.
+Settings | Pydantic Settings v2 | Typed environment parsing, validation, and a clear startup failure surface. | The settings model must be kept aligned with every deployment variable.
+Logging | structlog + stdlib logging | Machine-readable JSON with timestamps and levels for future aggregation. | Configuration must avoid duplicate handlers and secret leakage.
+Testing | pytest without live services | Fast, deterministic unit feedback for configuration and pure health logic. | It does not prove containers, clients, or integrations work.
+
+
+[TABLE 3]
+File | Role | Interview explanation
+core/config.py | Typed settings and validation | Startup configuration is treated as a contract, not arbitrary strings.
+core/health.py | Pure health data model | A dependency reports a status; SystemHealth applies deterministic precedence.
+core/logger.py | JSON logging setup | stdlib logging captures records while structlog adds consistent event fields.
+docker-compose.yml | Local infrastructure | The application depends on three free/open-source persistence or messaging services.
+tests/conftest.py | Test environment isolation | Each test receives controlled environment variables and a cleared settings cache.
+docs/adr/0000-infrastructure-baseline.md | Decision record | The reasons and consequences of infrastructure choices are written down.
+
+
+[TABLE 4]
+Group | Variables / examples | Handling
+Application | APP_ENV, LOG_LEVEL, SECRET_KEY | Literal values and minimum secret length; production checks some placeholders.
+Wazuh | WAZUH_API_URL, WAZUH_API_USER, WAZUH_API_PASSWORD, WAZUH_VERIFY_SSL | HTTPS URL validation; polling interval constrained to 5–3600 seconds.
+PostgreSQL | POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD | Typed port and required password; asyncpg DSN helper.
+Redis | REDIS_HOST, REDIS_PORT, REDIS_PASSWORD | Typed port and password-bearing URL helper.
+Neo4j | NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD | Allowed bolt://, neo4j://, and neo4j+s:// schemes.
+MISP | MISP_URL, MISP_API_KEY, MISP_VERIFY_SSL, MISP_TIMEOUT_SECONDS | Required URL/key and bounded timeout.
+LLM | LLM_PROVIDER, FAST_LLM_MODEL, REASONING_LLM_MODEL, LLM_API_KEY | Provider is a Literal; two model tiers are configured.
+Guardrail | MAX_ISOLATION_BLAST_RADIUS, PRIVILEGED_ACCOUNTS_REQUIRE_MANUAL_OVERRIDE | Policy values are typed and bounded where numeric.
+
+
+[TABLE 5]
+Command | Observed result | What it proves
+.\.venv\Scripts\python.exe -m pytest -q | 31 passed in 0.51s | Config validation, safe summary, caching, and health precedence pass in the local environment.
+docker compose config --quiet | Exit code 0, but warnings for unset PostgreSQL, Redis, and Neo4j passwords | Compose syntax parses; it also demonstrates that absent secrets do not currently fail closed.
+ruff check . | Not available: Ruff not installed globally or in .venv | No lint result was obtained.
+mypy core tests | Not available: mypy not installed globally or in .venv | No type-check result was obtained.
+Docker integration / smoke test | Not run | Container startup and health were not verified.
+
+
+[TABLE 6]
+Priority | Finding | Evidence / correction
+HIGH | Compose accepts missing required secrets. | docker-compose.yml interpolates blank values; require variables with an error and test rendered config.
+HIGH | Wazuh and MISP TLS verification default false. | core/config.py defaults both flags false; enable by default and reject insecure production settings.
+HIGH | Empty SystemHealth reports OK. | core/health.py returns OK for no services; use UNKNOWN/DEGRADED for readiness semantics.
+MEDIUM | DSN and Redis URL components are not escaped. | Reserved characters can break parsing; use URL builders/encoding and add tests.
+MEDIUM | Unknown environment variables are silently ignored. | extra='ignore' can hide misspellings; consider strict validation.
+MEDIUM | Database ports are exposed on all host interfaces. | Bind development ports to localhost or make publication explicit.
+LOW | Moving container tags reduce reproducibility. | Pin patch versions or digests and define an update process.
+
+
+[TABLE 7]
+Question | Strong answer
+Why cache settings? | Configuration is process-wide and expensive or surprising to reload; lru_cache gives one validated object. Tests explicitly clear it when changing environment variables.
+Why separate health data from health I/O? | Pure aggregation is deterministic and fast to unit test. Network clients can fail independently and later translate results into the model.
+Why Redis Streams instead of a larger broker? | At the planned scale, Streams provide ordered consumer groups with less operational complexity; the trade-off is that delivery and persistence semantics still need design.
+How do you protect secrets? | Keep them in .env, ignore that file in Git, mark Pydantic fields repr=False, omit them from safe_summary, and never log credential-bearing URLs.
+What would you fix first? | Fail-closed Compose secrets, secure TLS defaults, and the empty-health false positive before adding action-capable agents.
+
+
+[TABLE 8]
+Term | Meaning in this project
+ACID | Database guarantees of atomicity, consistency, isolation, and durability.
+AOF | Redis append-only file persistence; commands are recorded so state can be reconstructed.
+ADR | Architecture Decision Record: a short record of context, decision, alternatives, and consequences.
+DSN | Data Source Name; a structured connection string such as a PostgreSQL URL.
+FastAPI | Python web framework planned for the REST/WebSocket API phase.
+Health aggregation | Combining dependency statuses into one deterministic system status.
+LangGraph | The planned graph-based orchestration framework for multi-agent workflows.
+OCSF | Open Cybersecurity Schema Framework, planned for normalized security findings.
+Pydantic Settings | Typed configuration loader and validator for environment-backed settings.
+repr=False | Pydantic field setting that prevents a secret from appearing in object representations.
+Redis Stream | An append-oriented Redis data structure supporting ordered messages and consumer groups.
+structlog | Python library for structured, context-rich logging.
+Temporal graph | A graph whose relationships carry validity intervals and provenance.
+TOC field | A Word field that builds a table of contents from Heading styles.
+
+
+[TABLE 9]
+Category | Items
+Implemented | Project scaffold; Pydantic settings; URL/scheme and numeric validation; cached settings; redacted summary; structured logging setup; health model; Compose definitions; ADR; README; unit-test fixtures.
+Tested | 31 unit tests passed in the local .venv; settings cache and environment isolation; health precedence; selected validation and redaction behavior.
+Planned / later phases | PostgreSQL schema and migrations; Neo4j constraints/query layer; Wazuh ingestion; OCSF normalization and entity resolution; MISP/IAM enrichment; deterministic guardrail; LangGraph workflow; approval queue; FastAPI; dashboard; simulations.
+Unverified | Docker startup and health; live PostgreSQL/Redis/Neo4j connectivity; Wazuh/MISP clients; Ruff; mypy; coverage threshold; logging behavior under repeated configuration; production deployment hardening.
+Review corrections pending | Fail-closed Compose secrets; secure TLS defaults; empty-health semantics; URL escaping; strict/observable unknown environment handling; localhost bindings; pinned image versions.
+
