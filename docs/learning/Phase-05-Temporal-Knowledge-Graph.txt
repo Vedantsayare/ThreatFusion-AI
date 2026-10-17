@@ -1,0 +1,205 @@
+ThreatFusion AI
+Phase 5: Temporal Knowledge Graph with Neo4j
+Learning guide, implementation walkthrough, and validation record
+Source revision: Phase 5 Implementation  |  Documentation date: 17 October 2026
+
+Table of contents
+1. Purpose and Architecture
+2. Neo4j Graph Model and Entity Labels
+3. Relationship Types and Evidence Requirements
+4. Temporal Properties and Update Policy
+5. Canonical IDs, Uniqueness Constraints, and Idempotency
+6. Connection Configuration and Safe Credential Handling
+7. Example Graph Operations and Cypher Queries
+8. Unit and Integration Test Results
+9. Security Decisions, Limitations, and Future Work
+10. Interview-Ready Explanation
+11. Glossary
+12. Completion Checklist and Validation Record
+
+
+1. Purpose and Architecture
+ThreatFusion AI operates an agentic Security Operations Center (SOC) copilot pipeline: Ingestion (Phase 2) -> Normalization (Phase 3) -> Entity Resolution (Phase 4) -> Temporal Knowledge Graph Persistence (Phase 5) -> Multi-Agent Triage, Investigation, and Guardrails (Phases 6-7).
+
+Role of the temporal knowledge graph
+Traditional SIEM systems store security alerts as static, isolated relational rows or flat document logs. ThreatFusion AI introduces a temporal knowledge graph powered by Neo4j 5 Community Edition as the central memory layer. By linking entities (Assets, Identities, IOCs, TTPs) across incidents with temporal validity windows and confidence scores, downstream AI investigation agents can traverse historical context, observe lateral movement patterns, correlate recurring attack techniques, and reason across temporal boundaries.
+
+Implemented in Phase 5
+- Dedicated asynchronous Neo4j persistence client (Neo4jClient) in graph/client.py using the official neo4j Python driver (AsyncGraphDatabase / AsyncDriver).
+- Strict whitelist enforcement for node labels (Asset, Identity, IOC, TTP, Incident) and relationship types (AFFECTS, INVOLVES, CONTACTED, USES, RESOLVED_BY) to prevent Cypher injection.
+- Idempotent schema initialization: creates uniqueness constraints (REQUIRE n.id IS UNIQUE) and lookup indexes (IF NOT EXISTS) for all entity types.
+- Idempotent entity and relationship persistence: uses parameterized Cypher MERGE queries with confidence maximum-wins rules and deduplicated finding provenance lists.
+- Strict temporal edge schema: every graph relationship enforces valid_from, last_seen, valid_to (nullable), confidence, and source.
+- Health check probe returning typed ServiceHealth integrated with the Phase 0 health aggregation model.
+- Production TLS enforcement: rejects cleartext bolt:// URIs in production environments, requiring secure TLS encryption (neo4j+s:// or bolt+s://).
+- Safe credential handling: passwords are never logged, stored in plain text, or exposed in client representations.
+- Investigation query APIs: get_entity(), get_entity_neighborhood() (with bounded depth 1-3), get_incident_subgraph(), and run_query().
+- Comprehensive testing: 19 mocked unit tests for offline verification plus 1 live integration test executing real Cypher transactions against the local Docker Neo4j cluster.
+
+Deferred to future phases
+- LangGraph multi-agent orchestrator (Phase 7).
+- MISP threat intelligence graph enrichment (Phase 6).
+- Redis Streams ingestion queue workers.
+- Front-end Cytoscape.js interactive visualization (Phase 10).
+
+
+2. Neo4j Graph Model and Entity Labels
+The graph data model implements the canonical schema specified in Claude.md and Phase 4 entity resolution:
+
+Node Label | Description | Canonical ID Prefix | Key Properties
+Asset | Hosts, workstations, servers, Wazuh agents | asset:agent:{id} or asset:host:{name} | hostname, ip, role, ident_agent_id
+Identity | User accounts, service accounts | identity:user:{name}@{scope} | original_username, is_generic, host_scope
+IOC | Indicators of Compromise (IP addresses) | ioc:ip:{ip} | ip, version, is_private, is_loopback, is_global
+TTP | MITRE ATT&CK techniques | ttp:mitre:{technique_uid} | technique_id, technique_name, tactic
+Incident | Security finding (OCSF Class 2001) | finding:{finding_uid} | severity, severity_id, status, desc, created_time
+
+All nodes store:
+- id: String canonical identifier (enforced unique via database constraint).
+- name: Human-readable display label.
+- confidence: Float confidence score (0.0 to 1.0).
+- source_findings: Array of finding UIDs that contributed evidence.
+- created_at: Unix epoch timestamp when first observed.
+- updated_at: Unix epoch timestamp of the most recent observation.
+
+
+3. Relationship Types and Evidence Requirements
+Relationships are created only when supported by Phase 4 resolution evidence. The persistence layer rejects edge creation if either the source or destination node does not exist in the graph.
+
+Relationship Type | Source Node | Target Node | Evidence Requirement
+AFFECTS | Incident | Asset | Alert telemetry originates from or targets the specified device
+INVOLVES | Incident | Identity | Alert telemetry explicitly names the user account
+CONTACTED | IOC (Src IP) | IOC (Dst IP) | Network communication observed between source and destination endpoints
+CONTACTED | Incident | IOC (Dst/Src IP) | Security alert records connection attempt to indicator IP
+USES | Incident | TTP | Rule triggers a specific MITRE ATT&CK technique UID
+RESOLVED_BY | Asset/Identity | Finding | Audit link recording entity resolution evidence
+
+
+4. Temporal Properties and Update Policy
+Every graph edge strictly carries temporal and provenance metadata:
+
+Property | Type | Policy / Semantics
+valid_from | ISO 8601 String | Earliest observation timestamp when the relationship became valid
+last_seen | ISO 8601 String | Most recent observation timestamp where this relationship was re-corroborated
+valid_to | ISO 8601 String or null | End of temporal validity. Null indicates the relationship is ongoing
+confidence | Float (0.0 - 1.0) | Max-wins rule: updated only if subsequent evidence provides higher confidence
+source | String | Origin provenance identifier (e.g. "wazuh", "live_integration_test")
+
+Conservative temporal policy
+- Idempotent re-observation: If an identical relationship is observed in a later alert, MERGE matches the existing edge, preserves the original valid_from, updates last_seen to the new event timestamp, and applies confidence = max(existing, new).
+- Open-ended validity: valid_to is set only upon explicit closure evidence (e.g. account deleted, host decommissioned).
+- Absence is not termination: A later alert omitting a relationship is NOT evidence that the relationship ended. The graph never closes relationships based on negative inference.
+
+
+5. Canonical IDs, Uniqueness Constraints, and Idempotency
+Uniqueness constraints
+During client initialization (init_schema()), the following uniqueness constraints are idempotently applied:
+- CREATE CONSTRAINT asset_id_unique IF NOT EXISTS FOR (n:Asset) REQUIRE n.id IS UNIQUE
+- CREATE CONSTRAINT identity_id_unique IF NOT EXISTS FOR (n:Identity) REQUIRE n.id IS UNIQUE
+- CREATE CONSTRAINT ioc_id_unique IF NOT EXISTS FOR (n:IOC) REQUIRE n.id IS UNIQUE
+- CREATE CONSTRAINT ttp_id_unique IF NOT EXISTS FOR (n:TTP) REQUIRE n.id IS UNIQUE
+- CREATE CONSTRAINT incident_id_unique IF NOT EXISTS FOR (n:Incident) REQUIRE n.id IS UNIQUE
+
+Idempotent Cypher operations
+Node persistence Cypher:
+MERGE (n:Asset {id: $id})
+ON CREATE SET
+  n.name = $name,
+  n.confidence = $confidence,
+  n.source_findings = $source_findings,
+  n.created_at = $created_at,
+  n.updated_at = $updated_at,
+  n += $properties
+ON MATCH SET
+  n.name = COALESCE($name, n.name),
+  n.confidence = CASE WHEN $confidence > n.confidence THEN $confidence ELSE n.confidence END,
+  n.source_findings = reduce(acc = [], x IN (n.source_findings + $source_findings) | CASE WHEN x IN acc THEN acc ELSE acc + [x] END),
+  n.updated_at = $updated_at,
+  n += $properties
+RETURN n.id AS id
+
+This pattern guarantees that:
+1. Re-running the same event N times creates exactly 1 node and 1 edge.
+2. Weaker evidence cannot overwrite stronger existing evidence.
+3. Provenance arrays deduplicate finding UIDs without requiring the third-party APOC plugin.
+
+
+6. Connection Configuration and Safe Credential Handling
+Configuration parameters
+Neo4j settings are managed through AppSettings in core/config.py:
+- NEO4J_URI: Connection string (default "bolt://localhost:7687" in development).
+- NEO4J_USER: Database user (default "neo4j").
+- NEO4J_PASSWORD: Authentication secret (required from .env; repr=False).
+- Database: "neo4j" (default system database).
+
+Security rules
+- Production TLS enforcement: In production (APP_ENV="production"), the client verifies the URI scheme. Cleartext bolt:// or neo4j:// connections are rejected with GraphConnectionError. Connections must use neo4j+s:// or bolt+s:// with valid certificates.
+- Safe representation: Neo4jClient.__repr__() outputs: <Neo4jClient uri='bolt://localhost:7687' user='neo4j' database='neo4j'>, preventing password leakage into error logs or console traces.
+- Parameterized Cypher: Cypher injection is strictly prevented by parameterizing all node and edge attributes. Node labels and relationship types are validated against hardcoded frozenset whitelists before template substitution.
+
+
+7. Example Graph Operations and Cypher Queries
+Schema initialization
+await client.init_schema()
+
+Persisting a resolved finding batch
+counts = await client.persist_resolution_result(resolution_result)
+# Returns: {"nodes_persisted": 5, "relationships_persisted": 4}
+
+Querying an entity
+entity = await client.get_entity("asset:agent:001")
+
+Querying incident neighborhood (investigation subgraph)
+subgraph = await client.get_incident_subgraph("1697544000.12345")
+# Returns center incident node, connected neighbors (Asset, Identity, IOC, TTP), and relationship metadata
+
+
+8. Unit and Integration Test Results
+Validation covers both isolated mocked tests and live database transactions:
+
+Test Module | Execution Target | Tests Passed | Duration
+tests/unit/test_graph_persistence.py | Mocked AsyncDriver / AsyncSession | 19 passed | 0.68s
+tests/integration/test_neo4j_live.py | Real Docker Neo4j (bolt://127.0.0.1:7687) | 1 passed | 5.92s
+Full repository suite (pytest) | All unit and integration suites | 175 passed | 4.57s
+
+Static analysis results:
+- Ruff linter: All checks passed (0 errors, 0 warnings across all source files).
+- Mypy static type checker (strict mode): Success, no issues found in 27 source files.
+
+
+9. Security Decisions, Limitations, and Future Work
+Security decisions
+- Defense-in-depth label whitelisting: Interpolated Cypher tokens are restricted to validated Enums.
+- Sanitized property maps: Neo4j's type system rejects nested dictionaries; complex objects are safely serialized to JSON strings.
+- Least privilege: The client only executes schema and graph operations on its designated database.
+
+Limitations and future work
+- Historical relationship invalidation: Phase 5 records relationships with open-ended valid_to=None. Future correlation phases will implement explicit invalidation rules (e.g. IP reassignment upon DHCP lease expiry).
+- Cross-database transactions: Neo4j persistence and PostgreSQL audit logging operate in separate transactions; dual-write consistency will be managed by Redis Streams workers in future phases.
+- Threat intelligence correlation: Linking IOC nodes to external MISP threat indicators will be wired in Phase 6.
+
+
+10. Interview-Ready Explanation
+"In Phase 5 of ThreatFusion AI, I implemented the temporal knowledge graph persistence layer using Neo4j 5 Community Edition and the official asynchronous Python driver. While traditional SIEMs treat security alerts as flat, disconnected log lines, our architecture transforms normalized OCSF findings into an interconnected, temporal graph of Assets, Identities, Indicators of Compromise, and MITRE ATT&CK techniques.
+
+Idempotency and temporal integrity were critical design requirements: We enforce unique constraints on canonical IDs, and write entities and edges using parameterized Cypher MERGE statements. If the same alert is ingested multiple times, existing nodes and edges are updated rather than duplicated—preserving the earliest valid_from timestamp while updating last_seen and merging finding provenance without duplicates. Furthermore, we apply a strict confidence maximum-wins rule so weaker subsequent evidence cannot overwrite higher-confidence observations.
+
+Security was embedded at the connection layer: Production environments strictly reject unencrypted bolt connections, credentials are excluded from representations and logs, Cypher injection is prevented through parameterized attributes and strict label whitelists, and property types are sanitized against Neo4j's primitive constraints. The persistence layer passed 19 mocked unit tests and was verified through an end-to-end integration test against our live Docker Neo4j instance, bringing our full suite to 175 passing tests."
+
+
+11. Glossary
+- Temporal Knowledge Graph: A graph database structure that captures both relationships between entities and the time intervals during which those relationships were valid.
+- Canonical ID: A normalized, deterministic identifier uniquely addressing an entity across all data stores (e.g. asset:agent:001).
+- Uniqueness Constraint: A database rule ensuring that no two nodes with a given label share the same property value.
+- Parameterized Query: A database query pattern where variable data is passed as separate parameters rather than concatenated into the query string, preventing injection attacks.
+- High Watermark: A timestamp cursor preventing historical alert re-ingestion.
+
+
+12. Completion Checklist and Validation Record
+[TABLE 1: VERIFIED COMMAND OUTPUTS]
+Check | Command | Result | Details
+Mocked Unit Tests | pytest tests/unit/test_graph_persistence.py | Passed (19/19) | All Phase 5 persistence unit tests passed in 0.68s
+Live Integration Test | pytest tests/integration/test_neo4j_live.py | Passed (1/1) | Real Cypher round-trip verified against Docker Neo4j in 5.92s
+Full Test Suite | pytest | Passed (175/175) | Entire repository test suite passed in 4.57s
+Linter | ruff check . | Passed | 0 errors, 0 warnings across all files
+Type Checker | mypy core ingestion normalization graph tests | Passed | Success: 0 issues in 27 source files
+End of Phase 5 Learning Guide.
