@@ -23,6 +23,7 @@ _TEST_ENV: dict[str, str] = {
     "WAZUH_API_USER": "test-user",
     "WAZUH_API_PASSWORD": "test-wazuh-password",
     "WAZUH_VERIFY_SSL": "false",
+    "WAZUH_TIMEOUT_SECONDS": "10",
     # Postgres
     "POSTGRES_HOST": "localhost",
     "POSTGRES_PORT": "5432",

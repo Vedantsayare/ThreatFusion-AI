@@ -51,6 +51,7 @@ class AppSettings(BaseSettings):
     wazuh_api_password: str = Field(..., repr=False)
     wazuh_verify_ssl: bool = True
     wazuh_poll_interval_seconds: int = Field(default=15, ge=5, le=3600)
+    wazuh_timeout_seconds: int = Field(default=10, ge=1, le=120)
 
     # ── PostgreSQL ───────────────────────────────────────────────────────────
     postgres_host: str = "localhost"
@@ -190,6 +191,7 @@ class AppSettings(BaseSettings):
             "wazuh_api_url": self.wazuh_api_url,
             "wazuh_verify_ssl": self.wazuh_verify_ssl,
             "wazuh_poll_interval_seconds": self.wazuh_poll_interval_seconds,
+            "wazuh_timeout_seconds": self.wazuh_timeout_seconds,
             "postgres_host": self.postgres_host,
             "postgres_port": self.postgres_port,
             "postgres_db": self.postgres_db,

@@ -1,0 +1,244 @@
+ThreatFusion AI
+Phase 1: Secure Wazuh API Client
+Learning guide, implementation walkthrough, and validation record
+Source revision: 6526fd8  |  Documentation date: 17 October 2026
+Table of contents
+Right-click the field in Word and choose Update Field to populate page numbers.
+1. Project and Phase Overview
+ThreatFusion AI is an agentic Security Operations Center copilot. Its planned pipeline is Triage → Investigation → Correlation → Guardrail, with temporal context stored in a Neo4j knowledge graph. Wazuh is the upstream security-alert platform. Phase 1 creates the secure client boundary used to communicate with that Wazuh API.
+Purpose and scope
+The phase turns Wazuh authentication and basic API calls into a typed, asynchronous Python component. The client centralizes TLS policy, timeout behavior, token caching, retry-on-expired-token behavior, exception mapping, health reporting, and HTTP-session cleanup.
+Implemented
+Async WazuhClient built on httpx.AsyncClient.
+POST /security/user/authenticate using HTTP Basic Authentication.
+In-memory JWT token caching with a 14-minute safety TTL.
+Bearer token attachment to authenticated requests.
+One re-authentication and retry when an API request returns HTTP 401.
+Typed exceptions for authentication, TLS, connection, timeout, and API failures.
+GET helper, API-information helper, health check, and async context-manager cleanup.
+MockTransport-based unit tests that do not require a live Wazuh server.
+Deferred
+Phase 2 alert ingestion/polling and mock fallback.
+OCSF normalization and entity resolution.
+Persistence in PostgreSQL, Redis Streams, or Neo4j.
+FastAPI routes, LangGraph orchestration, guardrail decisions, and human approval.
+A live Wazuh integration test against the Ubuntu VM.
+2. Architecture and Design
+The client belongs in ingestion/. It is below future ingestion scheduling and above the external Wazuh API. It does not decide whether an alert is malicious and it does not perform an autonomous response.
+Reuse of Phase 0
+Phase 1 reuses the Phase 0 AppSettings singleton through get_settings(), the Phase 0 structlog logger, and the ServiceHealth model. The new Wazuh timeout setting is bounded from 1 to 120 seconds. Existing production policy continues to require TLS verification; WazuhClient adds a defense-in-depth constructor check.
+Actual initialization pattern from ingestion/wazuh_client.py
+self._settings = settings or get_settings()
+self._base_url = self._settings.wazuh_api_url.rstrip("/")
+self._verify_ssl = self._settings.wazuh_verify_ssl
+self._timeout = float(self._settings.wazuh_timeout_seconds)
+3. Wazuh API Authentication Flow
+The implementation authenticates with an HTTP POST to /security/user/authenticate. The credentials are supplied through HTTP Basic Authentication by httpx; the response is expected to contain data.token and error equal to zero.
+Numbered flow
+AppSettings loads the Wazuh base URL, username, password, TLS flag, and timeout from the environment.
+WazuhClient creates or receives an AsyncClient with the configured base URL, TLS verification, and timeout.
+authenticate() sends POST /security/user/authenticate with auth=(username, password).
+The client rejects HTTP 401 as WazuhAuthError, other HTTP 4xx/5xx responses as WazuhAPIError, malformed JSON as WazuhAPIError, non-zero Wazuh error codes as WazuhAuthError, and missing data.token as WazuhAuthError.
+A valid token is stored only in memory with a monotonic acquisition time.
+request() calls _ensure_token(), then adds Authorization: Bearer <token> to the API request.
+If the API returns 401, the token is cleared, authentication runs once under an asyncio lock, and the request is retried once.
+The response must be a JSON object with error equal to zero; otherwise WazuhAPIError is raised.
+Simplified sequence diagram based on the implemented flow
+Client                         Wazuh API
+  |                                |
+  | POST /security/user/authenticate
+  | Basic Auth (credentials)       |
+  |------------------------------->|
+  |                                |
+  | 200 {data: {token}, error: 0}  |
+  |<-------------------------------|
+  | cache token in memory          |
+  |                                |
+  | GET /...                       |
+  | Authorization: Bearer token    |
+  |------------------------------->|
+  |                                |
+  | 401? clear -> authenticate ->  |
+  | retry once                     |
+Token expiry and concurrency
+The client treats a token as valid for 840 seconds (14 minutes), slightly shorter than the documented Wazuh default of 15 minutes. time.monotonic() avoids wall-clock changes. asyncio.Lock prevents concurrent callers from performing duplicate authentication when the cache is empty or expired.
+4. Configuration and Environment Variables
+The password is required but intentionally has no value in this document. Other Phase 0 variables remain necessary for AppSettings construction, but they are outside the Wazuh client’s direct behavior.
+TLS override
+TLS verification is enabled by default. AppSettings rejects WAZUH_VERIFY_SSL=false in production. WazuhClient repeats the production check and logs a warning when verification is disabled outside production. This supports a local self-signed certificate without silently weakening production.
+5. Code Walkthrough
+Client construction and safe representation
+Actual safe __repr__; password and token are omitted
+def __repr__(self) -> str:
+    return (
+        f"<WazuhClient base_url={self._base_url!r} "
+        f"user={self._user!r} "
+        f"verify_ssl={self._verify_ssl!r} "
+        f"authenticated={self.is_authenticated}>"
+    )
+Authentication response handling
+Condensed actual authentication logic
+response = await self._client.post(
+    "/security/user/authenticate",
+    auth=(self._user, self._password),
+    headers={"Content-Type": "application/json"},
+)
+payload: Any = response.json()
+data = payload.get("data")
+token = data.get("token") if isinstance(data, dict) else None
+if not token or not isinstance(token, str):
+    raise WazuhAuthError(
+        "Wazuh authentication response missing JWT token in data.token"
+    )
+Request and retry handling
+Condensed actual request logic
+req_headers: dict[str, str] = {
+    "Authorization": f"Bearer {auth_token}"
+}
+response = await self._client.request(
+    method=method,
+    url=endpoint_path,
+    params=params,
+    json=json,
+    headers=req_headers,
+)
+if response.status_code == 401:
+    self._token = None
+    new_token = await self.authenticate()
+    response = await _send(new_token)
+Exceptions and logging
+httpx.ConnectError is classified as a TLS error when its message suggests certificate/SSL verification failure; otherwise it becomes WazuhConnectionError. TimeoutException becomes WazuhConnectionError with the configured timeout. Other RequestError values also become WazuhConnectionError. Logs record event names, base URL, username, endpoint, and error text, but the client’s representation and documented log fields do not include the password or token.
+Health and lifecycle
+check_health() calls GET / through the authenticated request path and returns ServiceHealth(name='wazuh', status=OK, detail=version) on success. WazuhError and unexpected exceptions become DOWN results. close() closes only clients created by WazuhClient; injected custom clients remain caller-owned. __aenter__ and __aexit__ support async with.
+6. Security Decisions
+Remaining security limitations
+No live certificate-validation test against the actual Wazuh VM was performed for this documentation.
+The token is held in process memory; a compromised process could read it.
+The client logs the target URL and username, so deployment logs must still be protected from sensitive topology disclosure.
+The project does not yet implement alert ingestion, authorization policy for downstream actions, or human approval.
+The TLS error classifier uses exception-message text; a future client adapter could provide more structured classification.
+7. Testing and Validation
+The Wazuh tests use httpx.MockTransport and AsyncClient instances. They simulate server responses without contacting the real Wazuh host or using real credentials.
+Reported validation results
+The following are the supplied validation results for the completed Phase 1 work. They are recorded as reported results for this document and are not presented as a new execution by this documentation task:
+These results do not prove live Wazuh authentication. No live Wazuh integration test is claimed here.
+8. End-to-End Request Flow
+Implemented end-to-end client flow
+Environment
+  WAZUH_API_URL / USER / PASSWORD / VERIFY_SSL / TIMEOUT
+                |
+                v
+AppSettings -> WazuhClient(httpx.AsyncClient)
+                |
+                +--> authenticate() -> POST /security/user/authenticate
+                |       -> cache data.token for 840 seconds
+                |
+                +--> get("/...")
+                        -> _ensure_token()
+                        -> Authorization: Bearer ...
+                        -> request()
+                        -> JSON object with error == 0
+                        -> caller receives dict[str, Any]
+
+check_health()
+  -> get("/")
+  -> ServiceHealth(OK, API version)
+  -> ServiceHealth(DOWN, error detail) on WazuhError
+This is the complete implemented client flow. There is no poll loop, queue publication, alert transformation, or persistence step in Phase 1.
+9. Limitations and Next Steps
+Phase 2 boundary
+Phase 2 should consume this client rather than duplicate its authentication logic. The ingestion layer can call get() or a future narrowly typed alert method, schedule polling using WAZUH_POLL_INTERVAL_SECONDS, translate failures through health/observability, and pass raw alert payloads to normalization. Alert text remains untrusted input and must not directly trigger actions.
+10. Interview-Ready Explanation
+“In Phase 1 I built the secure Wazuh API boundary for ThreatFusion AI. The client is asynchronous and uses httpx because later ingestion will need non-blocking network calls. It loads the Wazuh URL, credentials, TLS policy, and timeout through the Phase 0 Pydantic settings model. Authentication is a POST to /security/user/authenticate using HTTP Basic Authentication. When Wazuh returns a JWT in data.token, the client stores it only in memory and considers it valid for 14 minutes, slightly below the normal 15-minute lifetime. Every API request gets a Bearer token; if Wazuh returns 401, the client clears the token, re-authenticates under an asyncio lock, and retries exactly once. That avoids both stale-token failures and infinite retry loops.””
+“Security was a first-class concern: TLS verification is enabled by default, production rejects the insecure override, timeouts prevent hanging requests, typed exceptions separate authentication, TLS, network, and API failures, and __repr__ does not expose passwords or tokens. The health method converts successful API information into the existing ServiceHealth model. The tests use httpx.MockTransport to verify authentication, token reuse, 401 recovery, error mapping, health, and cleanup without a live server. The supplied final validation reports 73 tests passing, Ruff clean, and mypy clean across 11 source files. I would explicitly say those are mocked/unit and static checks; they do not prove live Wazuh authentication. Phase 2 will add alert polling and handoff to normalization.””
+11. Glossary
+12. Completion Checklist
+End of Phase 1 learning guide
+
+[TABLE 1]
+Scope note: Phase 1 implements the Wazuh API client and its tests. It does not implement alert polling, normalization, persistence, agent orchestration, or a live integration test.
+
+
+[TABLE 2]
+File / symbol | Responsibility
+ingestion/wazuh_client.py — WazuhClient | Owns async HTTP calls, authentication, token state, retries, health, and cleanup.
+WazuhError hierarchy | Separates connection/TLS failures, authentication failures, and API/protocol failures.
+core/config.py — AppSettings | Loads WAZUH_API_URL, credentials, TLS policy, polling interval, and timeout from environment variables.
+core/logger.py — get_logger | Provides the structlog logger used for safe operational events.
+core/health.py — ServiceHealth | Represents Wazuh availability as OK or DOWN for later aggregation.
+tests/unit/test_wazuh_client.py | Exercises authentication, requests, re-authentication, errors, health, and cleanup with mocked transports.
+
+
+[TABLE 3]
+Variable | Purpose | Safe example / behavior
+WAZUH_API_URL | HTTPS base URL for the Wazuh manager API. | https://wazuh.example.invalid:55000
+WAZUH_API_USER | Wazuh API username. | wazuh-api-user
+WAZUH_API_PASSWORD | Password used only for Basic Authentication. | Set locally; never document its value.
+WAZUH_VERIFY_SSL | Controls certificate verification in httpx. | true by default; false only for development self-signed certificates.
+WAZUH_TIMEOUT_SECONDS | Total HTTP client timeout used for Wazuh calls. | 10 by default; valid range 1–120.
+WAZUH_POLL_INTERVAL_SECONDS | Reserved for future polling behavior. | 15 by default; valid range 5–3600.
+APP_ENV | Controls production security rules. | development, staging, or production.
+
+
+[TABLE 4]
+Decision | Security value
+TLS verification true by default | Protects credentials and security data from certificate impersonation.
+Production rejects insecure TLS | Prevents an environment flag from silently disabling verification in production.
+Credentials from AppSettings | Keeps secrets outside source code and document artifacts.
+Token only in memory | Avoids writing the JWT to a database or file in this client.
+14-minute token TTL | Refreshes before the typical 15-minute Wazuh token lifetime.
+Single 401 retry | Recovers from expiry without creating an unbounded retry loop.
+Timeout and typed failures | Prevents indefinite hangs and lets callers distinguish operational causes.
+Safe repr/logging | Reduces accidental exposure of passwords and bearer tokens.
+
+
+[TABLE 5]
+Test group | What it verifies
+Initialization | Base URL normalization, TLS setting, timeout, and safe client representation.
+Authentication | Successful token extraction, HTTP 401, missing token, and non-zero Wazuh error code.
+Requests | Bearer attachment, cached-token reuse, and one-time re-authentication after 401.
+Errors | Connection, certificate, timeout, and API error mapping.
+Health | OK on mocked API information and DOWN on authentication/network failure.
+Context manager | Underlying client closes when WazuhClient owns it.
+
+
+[TABLE 6]
+Command | Supplied result | Meaning
+pytest | 73 passed in 1.36 seconds. | Unit suite reportedly passed.
+Ruff | All checks passed. | Lint reportedly passed.
+mypy | Success, no issues found in 11 source files. | Static typing reportedly passed.
+
+
+[TABLE 7]
+Category | Status
+Implemented | Secure asynchronous Wazuh client, authentication, token cache, 401 retry, typed errors, health check, cleanup, configuration, and mocked tests.
+Unit-tested | Authentication success/failure, token reuse, re-authentication, network/TLS/timeout/API errors, health outcomes, and cleanup.
+Mocked | All Wazuh HTTP responses in test_wazuh_client.py use MockTransport; no real Wazuh server is contacted.
+Live-verified | Not verified by this documentation task. Do not claim live authentication.
+Planned Phase 2 | Implement alert ingestion/polling, pagination or cursor strategy if required, mock fallback, backpressure/retry policy, normalization handoff, and durable audit/stream publication.
+
+
+[TABLE 8]
+Term | Definition
+Wazuh API | HTTP API exposed by a Wazuh manager for authentication, status, alerts, and other operations.
+REST API | An HTTP interface organized around resources, methods, status codes, and representations.
+HTTP Basic Authentication | An HTTP authentication scheme that sends a username and password through the HTTP client’s authentication mechanism.
+Authentication token / JWT | A signed token returned after login and sent as a Bearer credential on later requests.
+TLS | Transport Layer Security; it encrypts traffic and can verify the server certificate.
+Timeout | A maximum waiting period for an HTTP operation before it fails.
+Mocking | Replacing a real dependency with a controlled test double, such as httpx.MockTransport.
+Unit test | A focused automated test of a component or behavior in isolation.
+Async / await | Python syntax for cooperative non-blocking I/O and concurrent tasks.
+Token cache | Short-lived in-memory storage that avoids authenticating for every request.
+401 Unauthorized | HTTP status indicating that the current authentication is missing or rejected.
+ServiceHealth | The project’s small result model for reporting a dependency as OK, DOWN, or another status.
+
+
+[TABLE 9]
+Status | Items
+Implemented | WazuhClient, Basic-auth authentication endpoint, JWT cache/TTL, bearer requests, 401 retry, exceptions, TLS guard, timeout, health, cleanup, and Phase 0 integration.
+Unit-tested / mocked | 73-test supplied result covers Wazuh client behaviors through mocked HTTP transports; no real credentials are used.
+Supplied validation | pytest 73 passed in 1.36 seconds; Ruff all checks passed; mypy no issues in 11 source files.
+Live-verified | No live Wazuh authentication or external Wazuh API integration is verified in this document.
+Deferred | Phase 2 alert ingestion, polling, mock fallback, normalization handoff, persistence, and downstream agent workflow.
+
