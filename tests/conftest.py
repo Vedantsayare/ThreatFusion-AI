@@ -9,6 +9,7 @@ Secrets use obvious placeholder values; tests never connect to live services.
 from __future__ import annotations
 
 import os  # noqa: F401  (kept for future direct os.environ usage in tests)
+from collections.abc import Generator
 
 import pytest
 
@@ -49,7 +50,7 @@ _TEST_ENV: dict[str, str] = {
 
 
 @pytest.fixture(autouse=True)
-def isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def isolate_env(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
     """
     Patch environment variables for every test so no real .env file is required.
 
@@ -57,8 +58,9 @@ def isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
     so that env var changes in one test do not bleed into the next.
     """
     # Clear cached settings from previous test
-    from core.config import get_settings
+    from core.config import AppSettings, get_settings
     get_settings.cache_clear()
+    monkeypatch.setitem(AppSettings.model_config, "env_file", None)
 
     for key, value in _TEST_ENV.items():
         monkeypatch.setenv(key, value)
