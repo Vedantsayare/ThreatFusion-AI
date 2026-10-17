@@ -106,6 +106,7 @@ class AlertWorkflowRunner:
         self,
         settings: AppSettings | None = None,
         graph_client: Neo4jClient | None = None,
+        guardrail_engine: Any | None = None,
         enable_graph_persistence: bool = True,
         max_retries: int = 2,
         nodes: AlertWorkflowNodes | None = None,
@@ -117,6 +118,7 @@ class AlertWorkflowRunner:
 
         self.nodes = nodes or AlertWorkflowNodes(
             graph_client=graph_client,
+            guardrail_engine=guardrail_engine,
             enable_graph_persistence=enable_graph_persistence,
             max_retries=max_retries,
         )

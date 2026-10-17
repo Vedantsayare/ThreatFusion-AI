@@ -68,6 +68,7 @@ include = [
     "api*",
     "core*",
     "graph*",
+    "guardrails*",
     "ingestion*",
     "normalization*",
     "orchestrator*",

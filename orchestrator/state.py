@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agents.models import InvestigationContext, TriageResult
 from graph.models import ResolutionResult
+from guardrails.models import GuardrailResult
 from normalization.models import OCSFSecurityFinding
 
 
@@ -107,6 +108,11 @@ class AlertWorkflowState(TypedDict, total=False):
     completed_at: float | None
     duration_ms: float
 
+    # ── Guardrails & Audit ───────────────────────────────────────────────────
+    guardrail_results: list[dict[str, Any]]
+    pending_approvals: list[str]
+    audit_event_ids: list[str]
+
     # ── Structured Final Result ──────────────────────────────────────────────
     final_output: dict[str, Any] | None
 
@@ -137,8 +143,11 @@ class AlertWorkflowOutput(BaseModel):
     investigation_context: InvestigationContext | None = None
     triage_result: TriageResult | None = None
 
-    # Audit, uncertainty and error tracking
+    # Audit, uncertainty, guardrails, and error tracking
     errors: list[str] = Field(default_factory=list)
     uncertainties: list[str] = Field(default_factory=list)
+    guardrail_results: list[GuardrailResult] = Field(default_factory=list)
+    pending_approvals: list[str] = Field(default_factory=list)
+    audit_event_ids: list[str] = Field(default_factory=list)
     raw_alert_preserved: bool = True
     source_provenance: dict[str, Any] = Field(default_factory=dict)

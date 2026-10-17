@@ -18,6 +18,12 @@ from agents.triage import AlertTriageEngine
 from core.logger import get_logger
 from graph.client import GraphConnectionError, Neo4jClient
 from graph.resolver import EntityResolver
+from guardrails import (
+    ActionCategory,
+    ActionProposal,
+    GuardrailEngine,
+    GuardrailResult,
+)
 from normalization.normalizer import AlertSchemaError, NormalizationError, OCSFNormalizer
 from orchestrator.state import (
     AlertWorkflowOutput,
@@ -40,6 +46,7 @@ class AlertWorkflowNodes:
         graph_client: Neo4jClient | None = None,
         investigation_service: InvestigationService | None = None,
         triage_engine: AlertTriageEngine | None = None,
+        guardrail_engine: GuardrailEngine | None = None,
         enable_graph_persistence: bool = True,
         max_retries: int = 2,
         persistence_timeout_seconds: float = 5.0,
@@ -51,6 +58,7 @@ class AlertWorkflowNodes:
             investigation_service or InvestigationService(graph_client=graph_client)
         )
         self.triage_engine = triage_engine or AlertTriageEngine()
+        self.guardrail_engine = guardrail_engine or GuardrailEngine()
         self.enable_graph_persistence = enable_graph_persistence
         self.max_retries = max(0, max_retries)
         self.persistence_timeout_seconds = max(0.5, persistence_timeout_seconds)
@@ -133,6 +141,9 @@ class AlertWorkflowNodes:
             "completed_stages": completed_stages,
             "stage_records": stage_records,
             "errors": list(state.get("errors", [])),
+            "guardrail_results": list(state.get("guardrail_results", [])),
+            "pending_approvals": list(state.get("pending_approvals", [])),
+            "audit_event_ids": list(state.get("audit_event_ids", [])),
             "retry_counts": dict(state.get("retry_counts", {})),
             "max_retries": state.get("max_retries", self.max_retries),
             "retry_needed": False,
@@ -589,6 +600,60 @@ class AlertWorkflowNodes:
                 resolution=resolution,
                 context=context,
             )
+
+            # Evaluate advisory containment steps through GuardrailEngine
+            guardrail_results = list(state.get("guardrail_results", []))
+            pending_approvals = list(state.get("pending_approvals", []))
+            audit_event_ids = list(state.get("audit_event_ids", []))
+
+            target_entities: list[str] = []
+            if finding.device and finding.device.name:
+                target_entities.append(f"asset:host:{finding.device.name}")
+            elif finding.device and finding.device.uid:
+                target_entities.append(f"asset:agent:{finding.device.uid}")
+            if finding.src_endpoint and finding.src_endpoint.ip:
+                target_entities.append(f"ioc:ip:{finding.src_endpoint.ip}")
+
+            for step in triage_result.recommended_steps:
+                step_lower = step.lower()
+                action_name = None
+                category = ActionCategory.READ_ONLY
+
+                if "isolate" in step_lower:
+                    action_name = "isolate_host"
+                    category = ActionCategory.CONTAINMENT
+                elif "block" in step_lower:
+                    action_name = "block_ip"
+                    category = ActionCategory.CONTAINMENT
+                elif "disable" in step_lower or "revoke" in step_lower:
+                    action_name = "revoke_access"
+                    category = ActionCategory.REMEDIATION
+                elif "containment" in step_lower:
+                    action_name = "contain_incident"
+                    category = ActionCategory.CONTAINMENT
+
+                if action_name:
+                    proposal = ActionProposal(
+                        action_name=action_name,
+                        category=category,
+                        target_entities=target_entities,
+                        parameters={
+                            "finding_id": finding.finding_info.uid,
+                            "severity": finding.severity,
+                            "recommendation": step,
+                            "username": finding.user.name if finding.user else None,
+                        },
+                        rationale=step,
+                        evidence_refs=[f"finding:{finding.finding_info.uid}"],
+                        proposed_by="triage_engine",
+                    )
+                    guardrail_res = self.guardrail_engine.evaluate(proposal)
+                    guardrail_results.append(guardrail_res.model_dump())
+                    if guardrail_res.required_approvals:
+                        pending_approvals.extend(guardrail_res.required_approvals)
+                    if guardrail_res.audit_event_id:
+                        audit_event_ids.append(guardrail_res.audit_event_id)
+
             stage_records, completed_stages = self._record_stage(
                 state,
                 stage_name="perform_triage",
@@ -602,6 +667,9 @@ class AlertWorkflowNodes:
             return {
                 "triage_result": triage_result,
                 "triage_error": None,
+                "guardrail_results": guardrail_results,
+                "pending_approvals": pending_approvals,
+                "audit_event_ids": audit_event_ids,
                 "current_stage": "perform_triage",
                 "completed_stages": completed_stages,
                 "stage_records": stage_records,
@@ -682,6 +750,31 @@ class AlertWorkflowNodes:
         if state.get("persistence_error"):
             uncertainties.append(f"Graph persistence incomplete: {state.get('persistence_error')}")
 
+        # Log tamper-evident audit event for finalized alert processing
+        audit_store = self.guardrail_engine.audit_store
+        final_audit_event = audit_store.log_event(
+            actor="orchestrator",
+            operation="synthesize_final_result",
+            decision=overall_status.value,
+            policy_id=self.guardrail_engine.policy.policy_id,
+            outcome=f"Alert '{state.get('alert_id')}' finalized with status '{overall_status.value}'",
+            evidence_refs=[f"finding:{finding.finding_info.uid}"] if finding else [],
+            metadata={
+                "alert_id": state.get("alert_id"),
+                "priority": triage_res.priority.value if triage_res else None,
+                "score": triage_res.score if triage_res else None,
+                "duration_ms": duration_ms,
+            },
+        )
+        audit_event_ids = list(state.get("audit_event_ids", []))
+        audit_event_ids.append(final_audit_event.event_id)
+
+        # Parse guardrail results
+        raw_guardrail_results = state.get("guardrail_results", [])
+        parsed_guardrail_results = [
+            GuardrailResult.model_validate(r) for r in raw_guardrail_results
+        ]
+
         output = AlertWorkflowOutput(
             alert_id=state.get("alert_id", "unknown"),
             workflow_status=overall_status,
@@ -701,6 +794,9 @@ class AlertWorkflowNodes:
             triage_result=triage_res,
             errors=state.get("errors", []),
             uncertainties=uncertainties,
+            guardrail_results=parsed_guardrail_results,
+            pending_approvals=state.get("pending_approvals", []),
+            audit_event_ids=audit_event_ids,
             raw_alert_preserved=bool(state.get("raw_alert")),
             source_provenance=state.get("source_provenance", {}),
         )
