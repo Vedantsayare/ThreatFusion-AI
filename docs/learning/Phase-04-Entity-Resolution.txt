@@ -1,0 +1,206 @@
+ThreatFusion AI
+Phase 4: Entity Resolution
+Learning guide, implementation walkthrough, and validation record
+Source revision: Phase 4 Implementation  |  Documentation date: 17 October 2026
+
+Table of contents
+1. Project and Phase Overview
+2. Entity Types and Canonical Identifiers
+3. Matching Policy: Strong Identifiers vs Weak Attributes
+4. Ambiguity, Conflict Detection, and Merge Refusal
+5. Temporal Graph Relationships and Edge Requirements
+6. Security and Untrusted Input Isolation
+7. Code Architecture and Implementation Walkthrough
+8. Test Strategy and Verification Results
+9. Limitations and Downstream Graph Integration
+10. Interview-Ready Narrative
+11. Glossary
+12. Completion Checklist and Validation Record
+
+
+1. Project and Phase Overview
+ThreatFusion AI operates an agentic Security Operations Center (SOC) copilot pipeline: Ingestion (Phase 2) -> Normalization (Phase 3) -> Entity Resolution (Phase 4) -> Temporal Knowledge Graph Persistence (Phase 5) -> Triage & Investigation Multi-Agent System (Phases 6-7).
+
+Purpose and scope of Phase 4
+Raw security telemetry contains fragmented references to entities: hostnames, agent identifiers, IP addresses, usernames, and MITRE ATT&CK techniques. Entity Resolution disambiguates these references across multiple security findings, determining which references correspond to the same underlying entity and linking them via temporal relationships.
+
+Implemented in Phase 4
+- Dedicated graph models and resolution module under graph/ (models.py, resolver.py, __init__.py) with convenience re-export in normalization/resolution.py.
+- Strongly typed Pydantic models for graph nodes (Asset, Identity, IOC, TTP, Incident), temporal edges, resolution conflicts, and batch results.
+- Canonical identifier generation schemes for each entity type (e.g. asset:agent:001, identity:user:admin@host, ioc:ip:203.0.113.195, ttp:mitre:T1110).
+- Strict matching policy distinguishing strong identifiers (agent ID, technique UID, public IP) from weak or generic attributes (RFC 1918 private IPs, generic hostnames like "localhost", generic accounts like "root" or "admin").
+- Safe case-normalization: hostnames, usernames, and MITRE technique IDs are normalized for matching without mutating original casing in entity properties.
+- Conflict detection and merge refusal: if incoming evidence contradicts existing entity properties (e.g. two distinct hostnames claimed by the same agent ID, or two agents claiming the same hostname), silent merging is refused, separate entities are retained, and ResolutionConflict records are logged.
+- Provenance and temporal edges: every graph relationship strictly implements {valid_from, valid_to, confidence, source} conforming to ThreatFusion AI core graph constraints.
+- Graph ingestion readiness: serializes node and edge parameter lists ready for future Neo4j Cypher batch ingestion without executing persistence in this phase.
+- 17 focused unit tests verifying deduplication, case normalization, conflict refusal, generic scoping, missing fields, invalid IPs, determinism, and untrusted inputs.
+
+Deferred to future phases
+- Neo4j database live connection, constraint creation, and Cypher persistence (Phase 5).
+- Cross-source threat intelligence enrichment with MISP (Phase 5).
+- Identity resolution against external enterprise directories (Active Directory / LDAP / Okta).
+- Autonomous agent investigation and correlation reasoning.
+
+
+2. Entity Types and Canonical Identifiers
+The module defines five explicit graph entity types adhering to the ThreatFusion AI graph schema:
+
+Entity Type | Represents | Canonical ID Scheme | Example
+Asset | Host, server, workstation, agent | asset:agent:{agent_id} or asset:host:{hostname} | asset:agent:001, asset:host:web-server-01
+Identity | User account, service account | identity:user:{username}@{host_scope} | identity:user:admin@web-server-01, identity:user:vsayare
+IOC | Indicator of Compromise (IP address) | ioc:ip:{canonical_ip} | ioc:ip:203.0.113.195, ioc:ip:10.0.0.1
+TTP | MITRE ATT&CK Technique | ttp:mitre:{technique_uid} | ttp:mitre:T1110, ttp:mitre:T1059.001
+Incident | OCSF Security Finding | finding:{finding_uid} | finding:1697544000.12345
+
+
+3. Matching Policy: Strong Identifiers vs Weak Attributes
+A core failure mode in security graphs is false merging (unifying unrelated entities based on shared weak or reused attributes). The resolver enforces explicit matching policies:
+
+Asset matching policy
+- Strong identifier: Wazuh Agent ID (agent.id / device.uid). Agent IDs are globally unique within a Wazuh cluster. Two alerts sharing the same agent ID refer to the same asset, provided hostnames do not conflict.
+- Moderate identifier: Hostname (device.name). Normalized to lowercase for matching. If an alert lacks an agent ID but specifies a unique, non-generic hostname, it matches with confidence 0.85.
+- Weak identifier: Generic hostnames (e.g. "localhost", "ubuntu", "server", "debian"). A generic hostname without an agent ID is never merged across alerts. Each finding receives a separate, unmerged entity (confidence 0.4).
+- Weak attribute: IP address (device.ip). In modern enterprise and cloud environments, IP addresses are ephemeral (DHCP, NAT, dynamic IP reassignment) and frequently overlap across subnets. An IP address alone is never treated as an Asset identifier.
+
+Identity matching policy
+- Generic accounts: Common administrative or default usernames (e.g. "root", "admin", "administrator", "system", "guest", "nobody").
+  Rule: Generic accounts are always scoped to the host/device: identity:user:{username}@{host_scope}.
+  Result: "root" on web-server-01 and "root" on db-server-02 are maintained as separate, distinct Identity entities.
+- Specific accounts: Distinct usernames (e.g. "vsayare", "DOMAIN\\jdoe") are canonicalized as identity:user:{username} with high confidence (0.95).
+- Case normalization: Usernames are case-normalized for the canonical ID, but original casing is preserved in properties (e.g. original_username="Admin").
+
+IOC (IP address) matching policy
+- Validation: IP addresses are parsed and validated using Python's ipaddress module.
+- Scope classification: IPs are inspected for RFC 1918 private status, loopback, multicast, and globally routable status.
+- Confidence: Public routable IPs receive confidence 1.0; private or loopback IPs receive confidence 0.7 to reflect their non-globally unique scope.
+- Malformed inputs (e.g. "999.999.999.999" or "invalid-ip") are rejected and logged in unresolved.
+
+TTP (MITRE ATT&CK) matching policy
+- Strong identifier: Technique UID (e.g. "T1110" or sub-technique "T1110.001").
+- Case normalization: Normalized to uppercase. Multiple alerts exhibiting technique T1110 deterministically merge to the exact same canonical node ttp:mitre:T1110, accumulating finding provenance.
+
+
+4. Ambiguity, Conflict Detection, and Merge Refusal
+When evidence contradicts prior observations, forcing a merge corrupts the knowledge graph. The resolver detects and isolates conflicts:
+
+Conflicting hostnames on same agent ID
+- Scenario: Agent ID "001" was previously registered as "web-server-01". A subsequent alert with Agent ID "001" claims the hostname is "db-server-02".
+- Action: The resolver refuses to merge the entities. It creates a separate unmerged entity asset:agent:001:conflict-1 (confidence 0.5) and records a ResolutionConflict.
+
+Duplicate hostname claimed by distinct agent IDs
+- Scenario: Agent "001" is registered as "shared-host". A subsequent alert arrives with Agent "002" claiming the same hostname "shared-host".
+- Action: The resolver preserves distinct entities (asset:agent:001 and asset:agent:002) and logs a ResolutionConflict warning about the collision.
+
+Missing evidence
+- If a finding lacks a device, user, or IP, the resolver does not crash or invent dummy values. The missing attribute is recorded in result.unresolved for auditability. Missing evidence is never treated as a positive match.
+
+
+5. Temporal Graph Relationships and Edge Requirements
+Every relationship generated by EntityResolver conforms strictly to the ThreatFusion AI graph schema:
+
+Relationship Type | Source Node | Target Node | Semantics
+AFFECTS | Incident (Finding) | Asset (Device) | The detected event directly affects the host
+INVOLVES | Incident (Finding) | Identity (User) | The detected event involves the user account
+CONTACTED | IOC (Src IP) | IOC (Dst IP) | Network communication observed between endpoints
+CONTACTED | Incident (Finding) | IOC (Dst/Src IP) | The detected event contacted the indicator IP
+USES | Incident (Finding) | TTP (Technique) | The detected threat leveraged the ATT&CK technique
+
+Mandatory edge properties
+Every edge carries:
+1. valid_from: Event timestamp in ISO 8601 UTC format.
+2. valid_to: Nullable (None for ongoing/unbounded validity).
+3. confidence: Float score between 0.0 and 1.0 derived from entity/match strength.
+4. source: Telemetry provenance string (e.g. "wazuh").
+5. properties: Contextual attributes (e.g. protocol, src_port, dst_port).
+
+
+6. Security and Untrusted Input Isolation
+Alert telemetry originates from external agents and may contain adversary-controlled strings.
+
+Protections implemented
+- Passive data handling: Entity names, usernames, and hostnames are stored as plain dictionary strings without evaluating code or formatting templates.
+- Injection resilience: Telemetry strings containing SQL injection fragments (e.g. "admin'; DROP TABLE nodes; --"), XSS tags ("<script>alert(1)</script>"), or Cypher injection strings ("MATCH (n) DETACH DELETE n") are stored verbatim as passive properties.
+- Offline and deterministic: No language model (LLM) prompts or external network queries are used during entity resolution.
+
+
+7. Code Architecture and Implementation Walkthrough
+The entity resolution subsystem is implemented in:
+
+graph/models.py
+- EntityType: Enum defining Asset, Identity, IOC, TTP, Incident.
+- RelationshipType: Enum defining AFFECTS, INVOLVES, CONTACTED, USES, RESOLVED_BY.
+- EntityNode: Pydantic v2 model holding canonical_id, entity_type, name, identifiers, properties, confidence, and source_findings. Provides to_graph_dict().
+- RelationshipEdge: Pydantic v2 model holding source_id, target_id, rel_type, valid_from, valid_to, confidence, source, and properties. Provides to_graph_dict().
+- ResolutionConflict: Captures conflict metadata, candidate identifiers, and reasons.
+- ResolutionResult: Container holding entities, relationships, conflicts, and unresolved items, with to_cypher_parameters().
+
+graph/resolver.py
+- EntityResolver: The core resolution engine maintaining in-memory indexes (_assets, _identities, _iocs, _ttps, _incidents).
+- Methods: resolve_finding(), resolve_findings(), reset().
+- Internal handlers for devices, identities, endpoints, TTPs, conflicts, and temporal relationships.
+
+graph/__init__.py and normalization/resolution.py
+- Exports public interface from graph and provides a convenience alias in normalization.
+
+
+8. Test Strategy and Verification Results
+A dedicated unit test suite was implemented in tests/unit/test_entity_resolution.py covering 17 test cases:
+
+Test Class | Verifications Performed
+TestEntityExtractionAndGraphStructure | Complete finding extraction, presence of all 5 entity types, edge generation, mandatory edge properties (valid_from, valid_to, confidence, source), Cypher serialization
+TestDuplicateEntitiesAndDeduplication | Merging duplicate agents into single Asset node with provenance tracking; merging duplicate IOCs; merging duplicate TTPs
+TestCaseNormalization | Case-insensitive hostname matching (WEB-SERVER-01 vs web-server-01); username case normalization; MITRE technique ID case normalization
+TestConflictingIdentifiersAndAmbiguity | Merge refusal on conflicting hostnames for same agent ID; conflict detection for distinct agents claiming same hostname; host-scoping of generic usernames (root@web vs root@db); generic hostnames (localhost) kept unmerged
+TestMissingFieldsAndInvalidData | Missing device recorded in unresolved; missing user creates no identity; invalid IP (999.999.999.999) rejected; RFC 1918 private IP marked with reduced confidence (0.7)
+TestDeterminismAndUntrustedInput | Deterministic resolution repeatability across resets; safe preservation of malicious telemetry strings (SQLi, XSS, Cypher injection)
+
+Verification summary:
+- pytest tests/unit/test_entity_resolution.py: 17 passed in 0.21s
+- Full repository test suite (pytest -v): 154 passed in 1.53s (17 resolution + 44 normalization + 20 poller + 18 wazuh_client + 39 config + 16 health)
+- Ruff linter: All checks passed (0 errors, 0 warnings across all files)
+- Mypy static type checker (strict mode): Success, no issues found in 24 source files
+
+
+9. Limitations and Downstream Graph Integration
+Scope boundaries
+- Persistence is not implemented in this phase; entities and edges are prepared for Cypher batch insertion via to_cypher_parameters() but no database connection is opened.
+- Cross-source identity reconciliation (matching Wazuh local accounts to Okta/LDAP enterprise identities) is deferred to future enrichment phases.
+- Threat intelligence correlation (matching IOCs against MISP feeds) is deferred to Phase 5.
+
+Preparedness for Phase 5 (Neo4j Ingestion)
+The output of EntityResolver.resolve_findings() directly maps to Neo4j Cypher transactions:
+UNWIND $nodes AS node
+MERGE (n {id: node.id})
+SET n += node.properties, n.name = node.name, n.confidence = node.confidence;
+
+UNWIND $edges AS edge
+MATCH (src {id: edge.source_id}), (dst {id: edge.target_id})
+MERGE (src)-[r:RELATIONSHIP {valid_from: edge.valid_from}]->(dst)
+SET r += edge.properties, r.confidence = edge.confidence, r.source = edge.source;
+
+
+10. Interview-Ready Narrative
+"In Phase 4 of ThreatFusion AI, I implemented the deterministic Entity Resolution module that bridges normalized OCSF security findings with our temporal knowledge graph. Security graphs easily degrade if weak attributes cause false merges. To prevent this, our matching policy strictly distinguishes strong identifiers from weak attributes. Wazuh Agent IDs, MITRE technique UIDs, and public IP addresses act as strong anchors, whereas generic hostnames like 'localhost' or RFC 1918 private IPs are treated with caution.
+
+Crucially, we handle generic administrative usernames like 'root' or 'admin' by scoping them to the specific host, ensuring 'root' on a web server is never conflated with 'root' on a database server. When incoming telemetry presents conflicting evidence—such as a registered agent ID claiming a different hostname—the resolver refuses to perform a silent merge, logs an explicit ResolutionConflict, and preserves separate nodes with reduced confidence. 
+
+Every relationship generated strictly adheres to our core graph schema constraints, carrying valid_from, valid_to, confidence, and source. The module is fully decoupled from LLM prompts and external network calls, runs completely deterministically, and prepares serialized Cypher parameter payloads for subsequent Neo4j ingestion. The implementation is validated by 17 unit tests and passes strict Ruff and Mypy checks across the entire repository."
+
+
+11. Glossary
+- Entity Resolution: Disambiguating and linking real-world entities (hosts, users, indicators) from disparate log records.
+- Canonical Identifier: A normalized, deterministic string uniquely identifying an entity across the system (e.g. asset:agent:001).
+- Strong Identifier: An identifier with high uniqueness guarantee (e.g. Agent ID, MITRE Technique ID).
+- Weak Attribute: An attribute prone to reuse or collision (e.g. generic username, private RFC 1918 IP, generic hostname).
+- Resolution Conflict: An alert state where contradictory identifiers prevent a deterministic merge.
+- Temporal Relationship: An edge in the knowledge graph that records when a relationship became valid and when it expired.
+
+
+12. Completion Checklist and Validation Record
+[TABLE 1: VERIFIED COMMAND OUTPUTS]
+Check | Command | Result | Details
+Entity Resolution Tests | pytest tests/unit/test_entity_resolution.py | Passed (17/17) | All Phase 4 entity resolution tests passed in 0.21s
+Full Test Suite | pytest | Passed (154/154) | Complete repository unit test suite passing in 1.53s
+Linter | ruff check . | Passed | 0 errors, 0 warnings across all files
+Type Checker | mypy core ingestion normalization graph tests | Passed | Success: 0 issues in 24 source files
+End of Phase 4 Learning Guide.
