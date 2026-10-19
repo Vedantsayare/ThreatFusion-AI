@@ -1,0 +1,352 @@
+================================================================================
+THREATFUSION AI — DEPLOYMENT READINESS AUDIT (PHASES 0–10)
+COMPREHENSIVE TECHNICAL & SECURITY READINESS ASSESSMENT
+================================================================================
+
+Audit Date: October 2026
+Auditor: Automated Agentic Safety & Security Auditor
+Project Path: D:\Project\ThreatFusion-AI
+Target Environment: Pre-Deployment Staging / Local Docker Compose Infrastructure
+Overall Deployment Verdict: NOT READY FOR DIRECT PRODUCTION DEPLOYMENT (CONDITIONAL PASS FOR STAGING)
+
+================================================================================
+EXECUTIVE SUMMARY
+================================================================================
+ThreatFusion AI has successfully implemented a rich, technically rigorous architecture
+spanning Phases 0 through 10. The core analytical engine, OCSF-style normalization,
+entity resolution, LangGraph orchestration, deterministic triage policy, and React
+dashboard demonstrate exceptional design discipline with 246 automated tests passing,
+0 lint errors, and 0 type errors in strict mode.
+
+However, an objective deployment-readiness audit strictly distinguishes mocked unit
+tests from live production readiness. Critical gaps exist before the system can be safely
+exposed to enterprise networks:
+1. API Authentication & Authorization: Fast-API endpoints (/api/v1/alerts/ingest,
+   /api/v1/approvals/{id}/decide) have NO authentication or RBAC dependencies.
+2. Wazuh Authentication Failure: The live Wazuh manager (https://192.168.114.140:55000)
+   is reachable on the network, but the configured credentials fail with 401 Unauthorized.
+3. External Integrations Untested in Live Staging: MISP and IAM/CMDB operate solely via
+   mocked HTTP responses and in-memory mock providers. No live adapters exist.
+4. Ephemeral Audit & Investigation State: HashChainAuditStore and InvestigationStore
+   default to in-memory storage; audit and investigation records do not survive process restarts.
+
+================================================================================
+DETAILED AUDIT FINDINGS (CHECKS 1–10)
+================================================================================
+
+--------------------------------------------------------------------------------
+CHECK 1: Live Wazuh Authentication & Alert Ingestion
+--------------------------------------------------------------------------------
+Status: FAIL / PARTIAL
+Risk Level: HIGH
+Category: Alert Source Ingestion
+
+- Evidence:
+  * Network Endpoint: https://192.168.114.140:55000 (configured in .env).
+  * Direct Live Probe:
+    `WazuhClient(settings).check_health()` executed against https://192.168.114.140:55000.
+    Log Result:
+    2026-10-17 16:58:08 [info] wazuh_authenticating base_url=https://192.168.114.140:55000 user=wazuh-api-user
+    2026-10-17 16:58:08 [error] wazuh_health_check_failed error="Wazuh authentication failed (401 Unauthorized) for user 'wazuh-api-user'."
+    Health Result: ServiceStatus.DOWN.
+  * Ingestion Status: The network route and port 55000 are open and reachable, but authentication
+    is rejected by the Wazuh manager. No live alerts can be ingested until credentials are corrected.
+
+- Analysis:
+  While the Wazuh client code handles retries, token caching, and errors properly,
+  the actual deployment credentials in .env are invalid or expired on the target Wazuh VM.
+
+- Recommended Remediation:
+  1. Generate dedicated service account credentials on the Wazuh manager using `wazuh-apid`.
+  2. Grant the account read-only permissions to the `/alerts` endpoint.
+  3. Update `WAZUH_API_USER` and `WAZUH_API_PASSWORD` in `.env` on the host machine.
+  4. Once configured, re-verify with `python -m pytest tests/integration/test_wazuh_live.py`.
+
+--------------------------------------------------------------------------------
+CHECK 2: Live Neo4j Connectivity & Persistence
+--------------------------------------------------------------------------------
+Status: PASS
+Risk Level: LOW
+Category: Knowledge Graph Persistence Layer
+
+- Evidence:
+  * Container Status: `docker ps` reports `tf_neo4j` (neo4j:5.24-community) is "Up 4 hours (healthy)".
+  * Live Port Binding: Bound to `127.0.0.1:7687` (Bolt) and `127.0.0.1:7474` (HTTP).
+  * Direct Live Probe: `Neo4jClient(uri='bolt://localhost:7687').check_health()` returned `ServiceStatus.OK`.
+  * Live Integration Test: `tests/integration/test_neo4j_live.py::test_live_neo4j_connectivity_and_operations`
+    executed cleanly against live Docker container in 2.63s, validating:
+    - Constraint and index initialization (EntityNode canonical_id, Finding uid).
+    - Merging EntityNode and RelationshipEdge.
+    - Multi-hop temporal neighborhood Cypher queries.
+    - Cleanup of test entities.
+
+- Analysis:
+  The temporal graph persistence layer is fully functional, healthy, and correctly integrated
+  with the live database container.
+
+- Recommended Remediation:
+  Ensure Docker volume snapshots (`neo4j_data`) and regular automated backups are scheduled.
+
+--------------------------------------------------------------------------------
+CHECK 3: MISP & IAM/CMDB Integration Real-World Validation
+--------------------------------------------------------------------------------
+Status: NOT VERIFIED (Mocks Only)
+Risk Level: MEDIUM
+Category: External Threat Intelligence & Asset Directory
+
+- Evidence:
+  * Configuration: `.env` sets `MISP_URL=https://misp.local` and `MISP_API_KEY=REPLACE_WITH_MISP_API_KEY`.
+  * Source Code:
+    - `ingestion/cmdb.py`: Only `MockIAMCMDBProvider` is implemented with static seed data.
+    - No concrete connectors exist for Active Directory, LDAP, Okta, ServiceNow, or AWS Systems Manager.
+  * Test Suite:
+    - All MISP unit tests (`tests/unit/test_misp.py`) mock HTTP responses via `monkeypatch.setattr(httpx.AsyncClient, "post")`.
+    - No live MISP instance was probed during integration testing.
+
+- Analysis:
+  While the architecture adheres to the provider-neutral abstraction (`IAMCMDBProvider`) and
+  defensively enforces the principle of explicit uncertainty (missing intel != safe),
+  neither MISP nor IAM/CMDB has been validated against real enterprise infrastructure.
+
+- Recommended Remediation:
+  1. Implement concrete production providers (e.g., `LDAPIAMProvider`, `ServiceNowCMDBProvider`).
+  2. Deploy a local MISP container in a staging Docker network or connect to an internal SOC MISP instance.
+  3. Validate real-world certificate chains and API rate limits.
+
+--------------------------------------------------------------------------------
+CHECK 4: API Authentication, Authorization & Sensitive Endpoints
+--------------------------------------------------------------------------------
+Status: FAIL
+Risk Level: CRITICAL
+Category: API Security & Access Control
+
+- Evidence:
+  * Route Definitions (`api/routes.py`):
+    - `POST /api/v1/alerts/ingest` (unauthenticated)
+    - `POST /api/v1/approvals/{request_id}/decide` (unauthenticated)
+    - `POST /api/v1/investigations/{alert_id}/enrich` (unauthenticated)
+    - `GET /api/v1/investigations` (unauthenticated)
+  * No FastAPI `Depends`, `HTTPBearer`, `APIKeyHeader`, or OAuth2 security schemes are attached to routes.
+  * In `submit_approval_decision`, the `reviewer_id` is supplied arbitrarily by the client in the JSON body:
+    `reviewer_id: str` (no signature, session, or token verification).
+
+- Analysis:
+  Any entity capable of sending HTTP requests to the FastAPI backend can:
+  - Ingest untrusted alert data.
+  - Approve or reject high-risk containment actions on behalf of any reviewer name.
+  - Trigger resource-intensive enrichment workflows.
+  This represents an intolerable security vulnerability for production SOC operations.
+
+- Recommended Remediation:
+  1. Implement authentication middleware (e.g., OAuth2 with OIDC/JWT, or mutual TLS + API keys).
+  2. Bind approval decisions strictly to the authenticated subject (e.g., `user.sub` from verified JWT).
+  3. Enforce Role-Based Access Control (RBAC): require `role: "secops-analyst"` to view investigations,
+     and `role: "secops-lead"` to submit approval decisions.
+
+--------------------------------------------------------------------------------
+CHECK 5: Production TLS Enforcement & Secret Hygiene
+--------------------------------------------------------------------------------
+Status: PASS
+Risk Level: LOW
+Category: Cryptographic & Secret Management
+
+- Evidence:
+  * `core/config.py` (lines 160–205): `enforce_production_rules` validator:
+    - When `APP_ENV=production`, startup crashes with `ValueError` if any secret contains placeholder strings.
+    - When `APP_ENV=production`, startup crashes if `WAZUH_VERIFY_SSL=false` or `MISP_VERIFY_SSL=false`.
+  * `ingestion/misp.py` (line 127): Client constructor raises `ValueError` if `app_env == "production"` and `verify_ssl=False`.
+  * Pydantic Models: All passwords, keys, and tokens declare `Field(..., repr=False)` to prevent log leakage.
+  * `.gitignore`: Lines 1–9 explicitly exclude `.env`, `.env.*`, `*.pem`, `*.key`, `secrets/`.
+
+- Analysis:
+  Production rules are strictly coded to prevent accidental deployment with self-signed certificate overrides
+  or default passwords.
+
+- Recommended Remediation:
+  Ensure `APP_ENV=production` is hardcoded into container build definitions or orchestrator secrets.
+
+--------------------------------------------------------------------------------
+CHECK 6: Database Network Exposure
+--------------------------------------------------------------------------------
+Status: PASS
+Risk Level: LOW
+Category: Network Perimeter & Service Isolation
+
+- Evidence:
+  * `docker-compose.yml`:
+    - PostgreSQL: `127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432`
+    - Redis: `127.0.0.1:${REDIS_HOST_PORT:-6379}:6379`
+    - Neo4j: `127.0.0.1:${NEO4J_HTTP_HOST_PORT:-7474}:7474` and `127.0.0.1:${NEO4J_BOLT_HOST_PORT:-7687}:7687`
+  * Active Runtime Ports (`docker ps`):
+    - `3e570a287b3d`: `127.0.0.1:5432->5432/tcp`
+    - `70d7fd78ef6a`: `127.0.0.1:6379->6379/tcp`
+    - `9c1c10024e84`: `127.0.0.1:7474->7474/tcp, 127.0.0.1:7687->7687/tcp`
+
+- Analysis:
+  None of the database services listen on `0.0.0.0` or external LAN interfaces. They are strictly bound to localhost.
+
+- Recommended Remediation:
+  For multi-node production Kubernetes setups, remove host port publish directives entirely and utilize
+  internal Service names on isolated overlay networks.
+
+--------------------------------------------------------------------------------
+CHECK 7: Frontend Credential Exposure & Data Handling
+--------------------------------------------------------------------------------
+Status: PASS
+Risk Level: LOW
+Category: Client-Side Security
+
+- Evidence:
+  * `dashboard/src/`: Scanned all TypeScript source files; no hardcoded API keys, JWTs, or passwords exist.
+  * API Proxy: `dashboard/vite.config.ts` proxies `/api` and `/health` to backend `http://localhost:8000`.
+  * Untrusted Data Rendering: `dashboard/src/components/InvestigationDetail.tsx` renders all alert titles,
+    descriptions, and telemetry using React JSX text nodes (automatic HTML character entity escaping),
+    preventing Cross-Site Scripting (XSS).
+  * Production Build: `npm run build` generates clean static bundles in `dashboard/dist/` without dev tools.
+
+- Analysis:
+  The frontend adheres to modern secure SPA principles and contains no leaked credentials.
+
+- Recommended Remediation:
+  Add a Content-Security-Policy (CSP) meta tag or HTTP response header restricting script execution sources.
+
+--------------------------------------------------------------------------------
+CHECK 8: Audit Persistence & Fail-Closed Integrity
+--------------------------------------------------------------------------------
+Status: PARTIAL
+Risk Level: HIGH
+Category: Audit Trail & Non-Repudiation
+
+- Evidence:
+  * `guardrails/audit.py` (lines 156–160):
+    `HashChainAuditStore` maintains `self._events` in-memory. File persistence only occurs if `self.log_path`
+    is explicitly provided upon initialization.
+  * In `api/routes.py` and `orchestrator/nodes.py`, the default `HashChainAuditStore` is instantiated without
+    a persistent `log_path` or PostgreSQL backend sink.
+  * If the API server or container process terminates, historical audit records in memory are permanently lost.
+  * In `guardrails/engine.py`: If `audit_store.log_event()` fails, the exception aborts the evaluation,
+    failing closed (PASS for fail-closed behavior, FAIL for persistence).
+
+- Analysis:
+  While cryptographic hash chaining and fail-closed evaluation are implemented correctly,
+  audit durability across container restarts is not configured by default.
+
+- Recommended Remediation:
+  1. Mandate a durable PostgreSQL or append-only write-once-read-many (WORM) storage backend for `HashChainAuditStore`.
+  2. Add startup health checks that verify the audit store is writable before accepting alerts.
+
+--------------------------------------------------------------------------------
+CHECK 9: Human Approval Binding & Scope Validation
+--------------------------------------------------------------------------------
+Status: PASS
+Risk Level: LOW
+Category: Safety Guardrails & Access Enforcement
+
+- Evidence:
+  * `guardrails/approval.py` (lines 60–88) & `guardrails/models.py` (lines 55–70):
+    - `is_valid_for(action)` requires status == `APPROVED`.
+    - Validates that current time < `expires_at`.
+    - Computes SHA-256 hash over canonical serialized JSON: `action_name`, `category`, `target_entities` (sorted),
+      `parameters` (sorted keys), and `evidence_refs` (sorted).
+    - If any parameter or target is altered, hash validation fails immediately.
+  * Unit Test Verification: `tests/unit/test_resilience.py::test_guardrail_approval_cryptographic_binding`
+    explicitly tests parameter alteration and confirms that approval validation fails.
+
+- Analysis:
+  Human approval requests cannot be reused for different actions or modified scopes.
+
+- Recommended Remediation:
+  Implement a mandatory re-authentication challenge (password/TOTP prompt) when an analyst submits an approval.
+
+--------------------------------------------------------------------------------
+CHECK 10: Operational Documentation, Backups & Monitoring
+--------------------------------------------------------------------------------
+Status: PARTIAL
+Risk Level: MEDIUM
+Category: Site Reliability & Operations
+
+- Evidence:
+  * Documentation Review (`README.md`, `docs/`, `docs/learning/`):
+    - Comprehensive learning docs exist for all 10 phases.
+    - Configuration and local setup are thoroughly documented.
+  * Deficiencies:
+    - No backup runbook exists for PostgreSQL (`pg_dump`) or Neo4j (`neo4j-admin database dump`).
+    - No disaster recovery (RTO/RPO) procedures or volume restore instructions are defined.
+    - No Prometheus `/metrics` exporter is exposed on the FastAPI server for alert throughput,
+      queue latency, or Neo4j transaction times.
+
+- Analysis:
+  While architectural documentation is exemplary, operational runbooks for enterprise sysadmins are missing.
+
+- Recommended Remediation:
+  1. Author `docs/operations/backup-restore-runbook.md`.
+  2. Add Prometheus metrics (`prometheus-fastapi-instrumentator`) to `api/app.py`.
+  3. Include standard Alertmanager rules for Neo4j disk usage and Wazuh poller health.
+
+================================================================================
+TESTING & VERIFICATION BREAKDOWN
+================================================================================
+Total Test Suite: 246 Passed, 0 Failed, 0 Skipped (Execution time: ~7.1 seconds)
+
+1. Unit Tests (245 tests):
+   - Config validation (43 tests)
+   - OCSF Normalization (44 tests)
+   - Entity Resolution (17 tests)
+   - Graph Models & Mock Persistence (20 tests)
+   - Triage Engine & Scoring (14 tests)
+   - LangGraph Orchestration (13 tests)
+   - Guardrails, Approvals & Audit (18 tests)
+   - Health Checks (12 tests)
+   - Poller Pagination & Retries (20 tests)
+   - Wazuh Client HTTP Mocking (18 tests)
+   - MISP & IAM/CMDB Mocking (12 tests)
+   - FastAPI Endpoint Tests (6 tests)
+   - Resilience & Simulation Evaluation (8 tests)
+
+2. Live Integration Tests (1 test):
+   - `tests/integration/test_neo4j_live.py::test_live_neo4j_connectivity_and_operations`:
+     VERIFIED against live `bolt://localhost:7687` running in Docker container `tf_neo4j`.
+
+3. Live Network Probes:
+   - Wazuh Manager (https://192.168.114.140:55000): Reachable, but HTTP 401 Unauthorized (credentials invalid).
+   - Local Databases (Neo4j, Postgres, Redis): Verified live, healthy, and isolated to localhost.
+   - MISP & CMDB: Not tested live (no external infrastructure configured).
+
+================================================================================
+PRIORITIZED REMEDIATION CHECKLIST
+================================================================================
+
+[ ] PRIORITY 1 — BLOCKERS (Must be fixed prior to exposing to any network):
+    1. [ ] Implement API Authentication: Add OAuth2/JWT or API Key authentication to all
+           FastAPI endpoints under `/api/v1/`.
+    2. [ ] Enforce Approval RBAC: Restrict `/api/v1/approvals/{id}/decide` to authenticated
+           analysts with verified role claims; derive `reviewer_id` from token, not body.
+    3. [ ] Correct Wazuh Credentials: Update `.env` with active credentials on Wazuh VM
+           https://192.168.114.140:55000 to re-enable live alert ingestion.
+    4. [ ] Durable Audit Persistence: Configure `HashChainAuditStore` to persist audit records
+           to PostgreSQL or an append-only file mounted to a persistent volume.
+
+[ ] PRIORITY 2 — STAGING HARDENING (Must be fixed before production pilot):
+    5. [ ] Live MISP Integration: Deploy a staging MISP instance and validate TLS handshakes
+           and attribute lookups with real API keys.
+    6. [ ] Enterprise CMDB Adapter: Replace `MockIAMCMDBProvider` with a real LDAP/Okta and
+           asset inventory connector.
+    7. [ ] Content Security Policy (CSP): Add restrictive CSP headers to FastAPI middleware
+           and frontend HTML to protect dashboard users.
+
+[ ] PRIORITY 3 — OPERATIONAL READINESS (Documentation & Monitoring):
+    8. [ ] Operational Runbooks: Document automated backup and restore commands for
+           PostgreSQL and Neo4j (`docs/operations/runbook.md`).
+    9. [ ] Metrics Exporter: Expose Prometheus metrics (`/metrics`) for alert polling rate,
+           triage scores, and guardrail block counts.
+   10. [ ] Persistent Investigation Store: Migrate `InvestigationStore` from in-memory dict
+           to PostgreSQL with indexed queries and TTL retention policies.
+
+================================================================================
+AUDIT CONCLUSION
+================================================================================
+ThreatFusion AI demonstrates outstanding architectural design, deterministic safety
+controls, and code quality. However, until API authentication is implemented, Wazuh
+credentials are corrected, and audit logs are durably persisted to disk/database,
+the platform MUST NOT be deployed into a production enterprise environment.
+================================================================================

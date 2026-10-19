@@ -125,8 +125,10 @@ export const InvestigationDetail: React.FC<InvestigationDetailProps> = ({
             </p>
             <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
               {detail.pending_approvals.map((reqId) => {
-                const gr = detail.guardrail_results.find((g) => g.approval_request_id === reqId);
-                const actionDesc = gr ? `${gr.proposed_action.action_type} on ${gr.proposed_action.target_id}` : reqId;
+                const gr = detail.guardrail_results.find((g) => g.audit_event_id === reqId || g.required_approvals.includes(reqId));
+                const actionDesc = gr
+                  ? `${gr.action_proposal.action_name} on ${(gr.action_proposal.target_entities ?? []).join(', ') || 'target'}`
+                  : reqId;
                 return (
                   <button
                     key={reqId}
@@ -153,16 +155,16 @@ export const InvestigationDetail: React.FC<InvestigationDetailProps> = ({
             <div className="two-col-grid">
               <div className="sub-panel">
                 <div style={{ fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.5rem' }}>
-                  Rule: {triage.rule_id}
+                  {triage.finding_id ? `Finding: ${triage.finding_id}` : 'Triage Assessment'}
                 </div>
                 <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '0.75rem' }}>
-                  {triage.description}
+                  {triage.title || triage.severity || 'No title available'}
                 </div>
                 <div style={{ fontSize: '0.8rem', fontWeight: 600, marginBottom: '0.35rem' }}>
                   Assessment Factors:
                 </div>
                 <ul className="reasons-list">
-                  {triage.reasons.map((r, i) => (
+                  {(triage.reasons ?? []).map((r, i) => (
                     <li key={i}>{r}</li>
                   ))}
                 </ul>
@@ -173,7 +175,7 @@ export const InvestigationDetail: React.FC<InvestigationDetailProps> = ({
                   Recommended Response Actions:
                 </div>
                 <ul className="reasons-list" style={{ marginBottom: '0.75rem' }}>
-                  {triage.recommended_actions.map((act, i) => (
+                  {(triage.recommended_steps ?? []).map((act, i) => (
                     <li key={i}>{act}</li>
                   ))}
                 </ul>
@@ -182,8 +184,8 @@ export const InvestigationDetail: React.FC<InvestigationDetailProps> = ({
                   MITRE ATT&CK Techniques:
                 </div>
                 <div className="tag-container">
-                  {triage.mitre_techniques.length > 0 ? (
-                    triage.mitre_techniques.map((tech) => (
+                  {(triage.mitre_techniques ?? []).length > 0 ? (
+                    (triage.mitre_techniques ?? []).map((tech) => (
                       <span key={tech} className="tag-pill mitre">
                         {tech}
                       </span>
@@ -400,15 +402,24 @@ export const InvestigationDetail: React.FC<InvestigationDetailProps> = ({
             <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '0.5rem' }}>
               Tamper-evident SHA-256 Audit Records: {detail.audit_event_ids.length} recorded
             </div>
-            {detail.guardrail_results.map((gr, idx) => (
+            {(detail.guardrail_results ?? []).map((gr, idx) => (
               <div key={idx} style={{ padding: '0.4rem 0', borderBottom: '1px solid var(--border-subtle)', fontSize: '0.8rem' }}>
-                <span style={{ fontWeight: 600, color: gr.decision === 'ALLOW' ? 'var(--success)' : gr.decision === 'BLOCK' ? 'var(--danger)' : 'var(--warning)' }}>
+                <span style={{ fontWeight: 600, color: gr.decision === 'ALLOW' ? 'var(--success)' : (gr.decision === 'DENY' || gr.decision === 'ERROR') ? 'var(--danger)' : 'var(--warning)' }}>
                   [{gr.decision}]
                 </span>{' '}
-                Action: <span className="mono">{gr.proposed_action.action_type}</span> on <span className="mono">{gr.proposed_action.target_id}</span>
-                {gr.violations.length > 0 && (
+                Action: <span className="mono">{gr.action_proposal?.action_name ?? '—'}</span>
+                {' '}({gr.action_proposal?.category ?? '—'})
+                {(gr.action_proposal?.target_entities ?? []).length > 0 && (
+                  <> on <span className="mono">{gr.action_proposal.target_entities.join(', ')}</span></>
+                )}
+                {(gr.violations ?? []).length > 0 && (
                   <div style={{ color: 'var(--danger)', fontSize: '0.75rem', marginTop: '0.2rem' }}>
-                    Violations: {gr.violations.join(', ')}
+                    Violations: {gr.violations.map((v) => v.reason).join(', ')}
+                  </div>
+                )}
+                {gr.reason && (
+                  <div style={{ color: 'var(--text-secondary)', fontSize: '0.75rem', marginTop: '0.15rem' }}>
+                    Reason: {gr.reason}
                   </div>
                 )}
               </div>

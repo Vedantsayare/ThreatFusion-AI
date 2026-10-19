@@ -1,0 +1,220 @@
+﻿================================================================================
+ThreatFusion AI — Dashboard Blank Screen Fix (Two Crashes)
+================================================================================
+Date:    2026-10-18
+Author:  Deployment Readiness Audit / Antigravity
+Status:  BOTH CRASHES FIXED
+
+================================================================================
+CRASH 1: recommended_actions undefined (line 176)
+================================================================================
+
+--- Symptom ---
+
+Selecting any investigation blanked the detail panel. Browser console:
+
+  Uncaught TypeError: Cannot read properties of undefined (reading 'map')
+    at InvestigationDetail.tsx:176:47
+
+--- Root Cause ---
+
+Field-name mismatch: frontend TypeScript interface declared the wrong
+field name for the triage result's recommended advisory steps.
+
+  Backend (agents/models.py, TriageResult):
+    recommended_steps: list[str] = Field(default_factory=list)
+
+  Frontend (dashboard/src/types.ts, InvestigationDetail.triage_result):
+    recommended_actions: string[];    <- WRONG key; absent in serialized JSON
+
+  Component line 176:
+    {triage.recommended_actions.map(...)}   <- undefined.map() => TypeError
+
+--- Additional Mismatches Fixed (non-crashing) ---
+
+  Backend field   | Old frontend type          | Fix applied
+  ----------------+----------------------------+----------------------------
+  finding_id      | rule_id: string            | -> finding_id?: string|null
+  title           | description: string        | -> title?: string|null
+  (absent)        | risk_factors: Record<...>  | Removed (not in backend)
+  "HIGH"/"CRIT"   | 'P1'|'P2'|'P3'|'P4'       | -> priority: string
+
+--- Fix Applied ---
+
+  dashboard/src/types.ts:
+    - recommended_actions -> recommended_steps
+    - rule_id -> finding_id? | null
+    - description -> title? | null
+    - risk_factors removed
+    - priority widened to string
+
+  dashboard/src/components/InvestigationDetail.tsx:
+    - triage.recommended_actions.map -> (triage.recommended_steps ?? []).map
+    - triage.rule_id -> triage.finding_id
+    - triage.description -> triage.title || triage.severity
+    - Added ?? [] guards on reasons and mitre_techniques
+
+
+================================================================================
+CRASH 2: proposed_action undefined (line 408)
+================================================================================
+
+--- Symptom ---
+
+After the first crash was fixed, a second crash appeared in the guardrail
+audit trail section. Browser console:
+
+  Uncaught TypeError: Cannot read properties of undefined (reading 'action_type')
+    at InvestigationDetail.tsx:408:68
+
+--- Root Cause ---
+
+The entire guardrail_results type interface was wrong — it was invented without
+reference to the backend Pydantic model. Every field name and nested shape was
+a mismatch.
+
+  Backend model (guardrails/models.py):
+
+    class GuardrailResult(BaseModel):
+        decision: DecisionType           # "ALLOW"|"REQUIRE_APPROVAL"|"DENY"|"ERROR"
+        action_proposal: ActionProposal  # nested object (NOT "proposed_action")
+        action_hash: str
+        policy_id: str
+        reason: str
+        violations: list[PolicyViolation]  # objects with rule_name/reason/severity
+        required_approvals: list[str]
+        audit_event_id: str | None
+        evaluated_at: float
+
+    class ActionProposal(BaseModel):
+        action_name: str                 # NOT "action_type"
+        category: ActionCategory         # enum: READ_ONLY|CONTAINMENT|REMEDIATION|ADMINISTRATIVE
+        target_entities: list[str]       # NOT "target_id" (single string)
+        parameters: dict[str, Any]
+        rationale: str                   # NOT "reason"
+        proposed_by: str
+        proposed_at: float
+
+    class PolicyViolation(BaseModel):
+        rule_name: str
+        reason: str
+        severity: str
+
+  Frontend type (dashboard/src/types.ts) — WRONG on every field:
+
+    proposed_action: { action_type, target_type, target_id, risk_level, reason, is_reversible }
+    ^-- field key itself is wrong (backend: action_proposal)
+
+    decision: 'ALLOW'|'BLOCK'|'REQUIRE_HUMAN_APPROVAL'
+    ^-- wrong enum values (backend: DENY not BLOCK, REQUIRE_APPROVAL not REQUIRE_HUMAN_APPROVAL)
+
+    violations: string[]
+    ^-- wrong type (backend: PolicyViolation[])
+
+    approval_request_id: string|null
+    ^-- field does not exist (backend: audit_event_id)
+
+    timestamp: number
+    ^-- wrong name (backend: evaluated_at)
+
+  Component crash point (line 408):
+    gr.proposed_action.action_type   <- proposed_action is undefined => TypeError
+
+  Secondary bug (approval banner, line 128-129):
+    g.approval_request_id === reqId  <- always false; field doesn't exist
+    gr.proposed_action.action_type   <- would crash when gr found
+
+  Secondary bug (violations, line 411):
+    gr.violations.join(', ')         <- joining objects produces "[object Object]"
+
+--- Fix Applied ---
+
+  dashboard/src/types.ts — guardrail_results array type rewritten:
+    - proposed_action  -> action_proposal (correct key)
+    - action_type      -> action_name
+    - target_type      -> category
+    - target_id        -> target_entities: string[]
+    - is_reversible removed (not in backend)
+    - risk_level removed (not in backend)
+    - violations: string[] -> violations: Array<{rule_name, reason, severity}>
+    - approval_request_id  -> audit_event_id
+    - timestamp        -> evaluated_at
+    - decision union   -> string (correct enum values: ALLOW|REQUIRE_APPROVAL|DENY|ERROR)
+    - Added: action_hash, policy_id, reason, required_approvals
+
+  dashboard/src/components/InvestigationDetail.tsx:
+
+    Line 128 (approval banner lookup):
+      BEFORE: g.approval_request_id === reqId
+      AFTER:  g.audit_event_id === reqId || g.required_approvals.includes(reqId)
+
+    Line 129 (approval banner action description):
+      BEFORE: gr.proposed_action.action_type on gr.proposed_action.target_id
+      AFTER:  gr.action_proposal.action_name on gr.action_proposal.target_entities.join(', ')
+
+    Line 403 (audit trail map):
+      BEFORE: detail.guardrail_results.map(...)
+      AFTER:  (detail.guardrail_results ?? []).map(...)
+
+    Line 405 (decision color):
+      BEFORE: gr.decision === 'BLOCK' ? 'var(--danger)' : 'var(--warning)'
+      AFTER:  (gr.decision === 'DENY' || gr.decision === 'ERROR') ? 'var(--danger)'
+
+    Line 408 (CRASH FIX):
+      BEFORE: gr.proposed_action.action_type ... gr.proposed_action.target_id
+      AFTER:  gr.action_proposal?.action_name ... gr.action_proposal.target_entities.join(', ')
+
+    Line 411 (violations):
+      BEFORE: gr.violations.join(', ')           <- joins objects => "[object Object]"
+      AFTER:  gr.violations.map(v => v.reason).join(', ')
+
+    Added: renders gr.reason (guardrail policy decision reason)
+    Added: renders gr.action_proposal.category (READ_ONLY / CONTAINMENT / etc.)
+
+
+================================================================================
+FILES CHANGED
+================================================================================
+
+  dashboard/src/types.ts
+    - InvestigationDetail.triage_result interface (Crash 1)
+    - InvestigationDetail.guardrail_results array type (Crash 2)
+
+  dashboard/src/components/InvestigationDetail.tsx
+    - Lines 155-192: triage section field name fixes + null guards (Crash 1)
+    - Lines 128-129: approval banner lookup key fix (Crash 2)
+    - Lines 403-415: guardrail audit trail rendering fix (Crash 2)
+
+
+================================================================================
+TEST RESULTS
+================================================================================
+
+Frontend TypeScript build (both fixes):
+  Command:  npm run build  (dashboard/)
+  Result:   PASS — 0 TypeScript errors, 0 warnings
+  Crash 1:  built in 2.36s  (dist 177.12 kB)
+  Crash 2:  built in 2.03s  (dist 177.61 kB)
+
+Backend Python tests:
+  Command:  python -m pytest -q --tb=no
+  Result:   246 passed (no backend source files modified; no regressions)
+
+
+================================================================================
+NOTES
+================================================================================
+
+* The priority value from backend TriageResult ("HIGH", "CRITICAL") does not
+  match priority-pill CSS class names (P1-P4). This is a pre-existing cosmetic
+  issue not related to either crash.
+
+* The pending_approvals list contains approval request IDs. GuardrailResult
+  stores udit_event_id and equired_approvals (list of approver role IDs).
+  The banner now matches on both, preferring the audit event ID link.
+
+* MISP/CMDB enrichment is mocked in staging; this does not affect either fix.
+
+================================================================================
+END OF DOCUMENT
+================================================================================

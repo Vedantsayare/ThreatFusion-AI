@@ -81,28 +81,45 @@ export interface InvestigationDetail {
   persisted_edges_count: number;
   investigation_context?: Record<string, any> | null;
   triage_result?: {
-    priority: 'P1' | 'P2' | 'P3' | 'P4';
+    /** Maps to TriageResult.priority — serialized as string e.g. "HIGH" not "P1". */
+    priority: string;
     score: number;
-    rule_id: string;
-    description: string;
+    /** Maps to TriageResult.finding_id (backend field name). */
+    finding_id?: string | null;
+    /** Maps to TriageResult.title (backend field name). */
+    title?: string | null;
+    severity?: string | null;
     reasons: string[];
     mitre_techniques: string[];
-    recommended_actions: string[];
-    risk_factors: Record<string, any>;
+    /** Maps to TriageResult.recommended_steps (backend field name). */
+    recommended_steps: string[];
+    uncertainties?: string[];
+    has_missing_data?: boolean;
   } | null;
   guardrail_results: Array<{
-    decision: 'ALLOW' | 'BLOCK' | 'REQUIRE_HUMAN_APPROVAL';
-    proposed_action: {
-      action_type: string;
-      target_type: string;
-      target_id: string;
-      risk_level: string;
-      reason: string;
-      is_reversible: boolean;
+    /** Maps to DecisionType: ALLOW | REQUIRE_APPROVAL | DENY | ERROR */
+    decision: string;
+    /** Maps to GuardrailResult.action_proposal (backend field name). */
+    action_proposal: {
+      action_name: string;
+      /** Maps to ActionCategory enum: READ_ONLY | CONTAINMENT | REMEDIATION | ADMINISTRATIVE */
+      category: string;
+      target_entities: string[];
+      parameters: Record<string, unknown>;
+      rationale: string;
+      proposed_by?: string;
+      proposed_at?: number;
     };
-    violations: string[];
-    approval_request_id?: string | null;
-    timestamp: number;
+    action_hash: string;
+    policy_id: string;
+    reason: string;
+    /** Maps to PolicyViolation objects, not plain strings. */
+    violations: Array<{ rule_name: string; reason: string; severity: string }>;
+    required_approvals: string[];
+    /** Maps to GuardrailResult.audit_event_id (backend field name). */
+    audit_event_id?: string | null;
+    /** Maps to GuardrailResult.evaluated_at (backend field name). */
+    evaluated_at: number;
   }>;
   pending_approvals: string[];
   audit_event_ids: string[];
