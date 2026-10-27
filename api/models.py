@@ -4,21 +4,79 @@ api/models.py — Request and response schemas for ThreatFusion AI FastAPI endpo
 
 from __future__ import annotations
 
-from typing import Any, Generic, Literal, TypeVar
+from typing import Annotated, Any, Generic, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 T = TypeVar("T")
 
 
+SourceName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.:-]{1,64}$")]
+
+
 class AlertIngestRequest(BaseModel):
-    """Payload to ingest and process a security alert."""
+    """Payload to ingest and process a security alert (Wazuh-style JSON)."""
 
     model_config = ConfigDict(extra="ignore")
 
-    raw_alert: dict[str, Any]
-    source: str = "wazuh"
+    raw_alert: dict[str, Any] = Field(..., min_length=1)
+    source: SourceName = "wazuh"
     provenance: dict[str, Any] = Field(default_factory=dict)
+
+
+class AlertBatchIngestRequest(BaseModel):
+    """Up to 100 raw alerts from one source."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    alerts: list[dict[str, Any]] = Field(..., min_length=1, max_length=100)
+    source: SourceName = "wazuh"
+    provenance: dict[str, Any] = Field(default_factory=dict)
+
+
+class IncidentStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["OPEN", "INVESTIGATING", "ESCALATED", "RESOLVED", "FALSE_POSITIVE"]
+    reason: str = Field(..., min_length=3, max_length=1000)
+
+
+class NoteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(..., min_length=1, max_length=4000)
+
+
+class ActionProposalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action_name: str = Field(..., min_length=3, max_length=64)
+    target: str = Field(..., min_length=1, max_length=255)
+    rationale: str = Field(..., min_length=5, max_length=2000)
+
+
+class NarrativeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    use_llm: bool = False
+
+
+class IncidentSummary(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    incident_id: str
+    title: str
+    status: str
+    priority: str
+    risk_score: int
+    alert_count: int
+    hosts: list[str] = Field(default_factory=list)
+    users: list[str] = Field(default_factory=list)
+    tactics: list[str] = Field(default_factory=list)
+    first_seen: float | None = None
+    last_seen: float | None = None
+    updated_at: float
+    synthetic: bool = False
 
 
 class InvestigationSummary(BaseModel):
@@ -34,11 +92,17 @@ class InvestigationSummary(BaseModel):
     severity: str
     workflow_status: str
     received_at: float
+    event_time: float | None = None
     duration_ms: float
     asset_name: str | None = None
     username: str | None = None
+    src_ip: str | None = None
+    dst_ip: str | None = None
     mitre_techniques: list[str] = Field(default_factory=list)
     pending_approvals_count: int = 0
+    incident_id: str | None = None
+    source: str | None = None
+    synthetic: bool = False
 
 
 class PaginatedResponse(BaseModel, Generic[T]):  # noqa: UP046
@@ -68,6 +132,7 @@ class InvestigationDetailResponse(BaseModel):
 
     # Stages and domain results
     completed_stages: list[str] = Field(default_factory=list)
+    stage_records: dict[str, Any] = Field(default_factory=dict)
     finding: dict[str, Any] | None = None
     resolution: dict[str, Any] | None = None
     graph_persisted: bool = False
@@ -86,15 +151,24 @@ class InvestigationDetailResponse(BaseModel):
     # External enrichment
     enrichment: dict[str, Any] | None = None
 
+    # Correlation & provenance
+    incident_id: str | None = None
+    source_provenance: dict[str, Any] = Field(default_factory=dict)
+    deduplicated: bool = False
+
 
 class ApprovalDecisionRequest(BaseModel):
-    """Reviewer decision payload for human-in-the-loop approval."""
+    """Reviewer decision payload for human-in-the-loop approval.
+
+    ``reviewer_id`` is accepted for backward compatibility but IGNORED: the
+    reviewer recorded is always the authenticated principal.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
-    reviewer_id: str
     decision: Literal["APPROVE", "REJECT"]
-    reason: str | None = None
+    reason: str | None = Field(default=None, max_length=2000)
+    reviewer_id: str | None = Field(default=None, description="Deprecated; ignored")
 
 
 class ApprovalDecisionResponse(BaseModel):
@@ -119,6 +193,10 @@ class IntegrationsStatusResponse(BaseModel):
     neo4j: dict[str, Any]
     misp: dict[str, Any]
     cmdb: dict[str, Any]
+    persistence: dict[str, Any] = Field(default_factory=dict)
+    llm: dict[str, Any] = Field(default_factory=dict)
+    auth: dict[str, Any] = Field(default_factory=dict)
+    demo_mode: bool = False
 
 
 class HealthResponse(BaseModel):

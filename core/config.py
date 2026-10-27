@@ -46,6 +46,9 @@ class AppSettings(BaseSettings):
     # TLS verification is ENABLED by default.
     # Set WAZUH_VERIFY_SSL=false only for local development with self-signed
     # certificates. Production rejects verify_ssl=false (see model_validator).
+    # Background polling of the Wazuh API is opt-in; alerts can always be
+    # submitted via POST /api/v1/alerts/ingest instead.
+    wazuh_enabled: bool = False
     wazuh_api_url: str
     wazuh_api_user: str
     wazuh_api_password: str = Field(..., repr=False)
@@ -83,14 +86,36 @@ class AppSettings(BaseSettings):
     misp_timeout_seconds: int = Field(default=10, ge=1, le=60)
 
     # ── LLM ──────────────────────────────────────────────────────────────────
-    llm_provider: Literal["openai", "anthropic", "gemini", "ollama"] = "openai"
-    fast_llm_model: str = "gpt-4o-mini"
-    reasoning_llm_model: str = "gpt-4o"
+    # Only the investigation narrative may use an LLM. "none" selects the
+    # deterministic template. openai/gemini are accepted for backward
+    # compatibility but are not implemented (template fallback, labelled).
+    llm_provider: Literal["none", "openai", "anthropic", "gemini", "ollama"] = "none"
+    fast_llm_model: str = "claude-haiku-5-5"
+    reasoning_llm_model: str = "claude-opus-5-5"
     llm_api_key: str = Field(..., repr=False)
+    llm_base_url: str | None = None
+    llm_timeout_seconds: float = Field(default=30.0, ge=1.0, le=300.0)
 
     # ── Guardrail policy ─────────────────────────────────────────────────────
     max_isolation_blast_radius: int = Field(default=3, ge=1, le=50)
     privileged_accounts_require_manual_override: bool = True
+    approval_timeout_seconds: int = Field(default=1800, ge=30, le=86400)
+
+    # ── API security ─────────────────────────────────────────────────────────
+    # Comma-separated "name:role:key" triples. Keys with placeholders are ignored.
+    api_keys: str = Field(default="", repr=False)
+    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    max_request_bytes: int = Field(default=262_144, ge=1024, le=10_485_760)
+    # Per-client request budget (0 disables) and auth brute-force lockout.
+    rate_limit_per_minute: int = Field(default=600, ge=0, le=100_000)
+    auth_max_failures: int = Field(default=10, ge=0, le=1000)
+    auth_lockout_seconds: int = Field(default=300, ge=10, le=86_400)
+
+    # ── Persistence & runtime modes ──────────────────────────────────────────
+    persistence_backend: Literal["postgres", "sqlite", "memory"] = "postgres"
+    sqlite_path: str = "./threatfusion.db"
+    neo4j_enabled: bool = True
+    demo_mode: bool = True
 
     # ── Computed helpers ─────────────────────────────────────────────────────
 
@@ -108,6 +133,11 @@ class AppSettings(BaseSettings):
             f"postgresql+asyncpg://{user}:{pw}"
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        """Explicit CORS allow-list; wildcard origins are never returned."""
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip() and o.strip() != "*"]
 
     @property
     def redis_url(self) -> str:
@@ -223,6 +253,13 @@ class AppSettings(BaseSettings):
             "privileged_accounts_require_manual_override": (
                 self.privileged_accounts_require_manual_override
             ),
+            "approval_timeout_seconds": self.approval_timeout_seconds,
+            "rate_limit_per_minute": self.rate_limit_per_minute,
+            "auth_max_failures": self.auth_max_failures,
+            "persistence_backend": self.persistence_backend,
+            "neo4j_enabled": self.neo4j_enabled,
+            "demo_mode": self.demo_mode,
+            "cors_origins": self.cors_origin_list,
         }
 
 

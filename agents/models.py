@@ -83,6 +83,17 @@ class InvestigationContext(BaseModel):
     missing_evidence: list[str] = Field(default_factory=list)
 
 
+class ScoreContribution(BaseModel):
+    """One additive term of the deterministic triage score."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    factor: str
+    points: int
+    detail: str
+    evidence_ref: str | None = None
+
+
 class TriageResult(BaseModel):
     """Structured, deterministic assessment of an incident's priority and investigation scope."""
 
@@ -97,6 +108,8 @@ class TriageResult(BaseModel):
 
     # Reasons and justification
     reasons: list[str] = Field(default_factory=list)
+    score_breakdown: list[ScoreContribution] = Field(default_factory=list)
+    priority_rule: str | None = None
     evidence: list[EvidenceItem] = Field(default_factory=list)
     mitre_techniques: list[str] = Field(default_factory=list)
 
@@ -109,4 +122,4 @@ class TriageResult(BaseModel):
 
     # Provenance
     triaged_at: float = Field(default_factory=time.time)
-    policy_version: str = "1.0.0"
+    policy_version: str = "1.1.0"

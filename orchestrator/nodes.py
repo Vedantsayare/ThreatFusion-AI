@@ -24,6 +24,7 @@ from guardrails import (
     GuardrailEngine,
     GuardrailResult,
 )
+from ingestion.enrichment import EnrichmentService
 from normalization.normalizer import AlertSchemaError, NormalizationError, OCSFNormalizer
 from orchestrator.state import (
     AlertWorkflowOutput,
@@ -50,6 +51,8 @@ class AlertWorkflowNodes:
         enable_graph_persistence: bool = True,
         max_retries: int = 2,
         persistence_timeout_seconds: float = 5.0,
+        enrichment_service: EnrichmentService | None = None,
+        enrichment_timeout_seconds: float = 15.0,
     ) -> None:
         self.normalizer = normalizer or OCSFNormalizer()
         self.resolver = resolver or EntityResolver()
@@ -62,6 +65,8 @@ class AlertWorkflowNodes:
         self.enable_graph_persistence = enable_graph_persistence
         self.max_retries = max(0, max_retries)
         self.persistence_timeout_seconds = max(0.5, persistence_timeout_seconds)
+        self.enrichment_service = enrichment_service
+        self.enrichment_timeout_seconds = max(1.0, enrichment_timeout_seconds)
 
     # ── Helper: Record Stage Metadata ────────────────────────────────────────
 
@@ -281,6 +286,11 @@ class AlertWorkflowNodes:
             }
 
         try:
+            # Scope resolution to this alert. The resolver is stateful; without a
+            # reset every result would re-include all previously seen entities
+            # (unbounded growth and redundant graph writes). Cross-alert identity
+            # continuity comes from deterministic canonical IDs merged in Neo4j.
+            self.resolver.reset()
             resolution = self.resolver.resolve_finding(finding)
             stage_records, completed_stages = self._record_stage(
                 state,
@@ -569,6 +579,69 @@ class AlertWorkflowNodes:
                 "stage_records": stage_records,
             }
 
+    # ── Node 6b: Enrich Indicators ───────────────────────────────────────────
+
+    async def enrich_indicators(self, state: AlertWorkflowState) -> dict[str, Any]:
+        """Query threat-intel and CMDB/IAM context before deterministic triage.
+
+        Failures never block triage: enrichment is reported as unavailable and
+        indicators stay UNKNOWN (absence of intel is never treated as benign).
+        """
+        start_time = time.time()
+        finding = state.get("finding")
+
+        if finding is None or self.enrichment_service is None:
+            stage_records, completed_stages = self._record_stage(
+                state,
+                stage_name="enrich_indicators",
+                status=StageStatus.SKIPPED,
+                started_at=start_time,
+                message="Enrichment skipped: no finding or enrichment service not configured",
+            )
+            return {
+                "enrichment": None,
+                "current_stage": "enrich_indicators",
+                "completed_stages": completed_stages,
+                "stage_records": stage_records,
+            }
+
+        try:
+            enrichment = await asyncio.wait_for(
+                self.enrichment_service.enrich_finding(finding),
+                timeout=self.enrichment_timeout_seconds,
+            )
+            verdicts = enrichment.get("indicator_verdicts", {})
+            stage_records, completed_stages = self._record_stage(
+                state,
+                stage_name="enrich_indicators",
+                status=StageStatus.SUCCESS,
+                started_at=start_time,
+                message=f"Enriched {len(verdicts)} indicator(s) and asset/identity context",
+            )
+            return {
+                "enrichment": enrichment,
+                "current_stage": "enrich_indicators",
+                "completed_stages": completed_stages,
+                "stage_records": stage_records,
+            }
+        except Exception as err:
+            err_text = str(err) or type(err).__name__
+            logger.warning("workflow_enrichment_failed", alert_id=state.get("alert_id"), error=err_text)
+            stage_records, completed_stages = self._record_stage(
+                state,
+                stage_name="enrich_indicators",
+                status=StageStatus.PARTIAL,
+                started_at=start_time,
+                error=f"Enrichment unavailable: {err_text}",
+            )
+            return {
+                "enrichment": None,
+                "enrichment_error": err_text,
+                "current_stage": "enrich_indicators",
+                "completed_stages": completed_stages,
+                "stage_records": stage_records,
+            }
+
     # ── Node 7: Perform Triage ───────────────────────────────────────────────
 
     def perform_triage(self, state: AlertWorkflowState) -> dict[str, Any]:
@@ -599,6 +672,7 @@ class AlertWorkflowNodes:
                 finding,
                 resolution=resolution,
                 context=context,
+                enrichment=state.get("enrichment"),
             )
 
             # Evaluate advisory containment steps through GuardrailEngine
@@ -647,7 +721,10 @@ class AlertWorkflowNodes:
                         evidence_refs=[f"finding:{finding.finding_info.uid}"],
                         proposed_by="triage_engine",
                     )
-                    guardrail_res = self.guardrail_engine.evaluate(proposal)
+                    guardrail_res = self.guardrail_engine.evaluate(
+                        proposal,
+                        context={"alert_id": state.get("alert_id"), **state.get("approval_context", {})},
+                    )
                     guardrail_results.append(guardrail_res.model_dump())
                     if guardrail_res.required_approvals:
                         pending_approvals.extend(guardrail_res.required_approvals)
@@ -749,6 +826,8 @@ class AlertWorkflowNodes:
             uncertainties.append(f"Investigation degraded: {state.get('investigation_error')}")
         if state.get("persistence_error"):
             uncertainties.append(f"Graph persistence incomplete: {state.get('persistence_error')}")
+        if state.get("enrichment_error"):
+            uncertainties.append(f"Threat-intel enrichment unavailable: {state.get('enrichment_error')}")
 
         # Log tamper-evident audit event for finalized alert processing
         audit_store = self.guardrail_engine.audit_store
@@ -799,6 +878,7 @@ class AlertWorkflowNodes:
             audit_event_ids=audit_event_ids,
             raw_alert_preserved=bool(state.get("raw_alert")),
             source_provenance=state.get("source_provenance", {}),
+            enrichment=state.get("enrichment"),
         )
 
         return {

@@ -11,6 +11,8 @@ Enforces:
 
 from __future__ import annotations
 
+from typing import Any
+
 from core.logger import get_logger
 from guardrails.approval import ApprovalRequest, ApprovalService
 from guardrails.audit import HashChainAuditStore
@@ -83,10 +85,15 @@ class GuardrailEngine:
         self,
         proposal: ActionProposal,
         approval: ApprovalRequest | None = None,
+        context: dict[str, Any] | None = None,
+        actor: str | None = None,
     ) -> GuardrailResult:
         """Evaluate an action proposal against safety policies and optional human approval.
 
         Enforces fail-closed semantics: any failure during evaluation denies authorization.
+        ``context`` (e.g. incident_id) is attached to any approval request created.
+        ``actor`` is who triggered this evaluation (defaults to the proposer); e.g.
+        the approver executing an approved action.
         """
         action_hash = proposal.compute_action_hash()
         violations: list[PolicyViolation] = []
@@ -102,6 +109,7 @@ class GuardrailEngine:
                 )
                 violations.append(violation)
                 return self._finalize_result(
+                    actor=actor,
                     decision=DecisionType.DENY,
                     proposal=proposal,
                     action_hash=action_hash,
@@ -122,6 +130,7 @@ class GuardrailEngine:
                 )
                 violations.append(violation)
                 return self._finalize_result(
+                    actor=actor,
                     decision=DecisionType.DENY,
                     proposal=proposal,
                     action_hash=action_hash,
@@ -132,6 +141,7 @@ class GuardrailEngine:
             # 3. Read-Only Operations (Passive investigation/triage)
             if proposal.category == ActionCategory.READ_ONLY:
                 return self._finalize_result(
+                    actor=actor,
                     decision=DecisionType.ALLOW,
                     proposal=proposal,
                     action_hash=action_hash,
@@ -168,8 +178,9 @@ class GuardrailEngine:
 
                 # If no approval was provided, create/record an approval request
                 if approval is None:
-                    req = self.approval_service.create_request(proposal)
+                    req = self.approval_service.create_request(proposal, context=context)
                     return self._finalize_result(
+                    actor=actor,
                         decision=DecisionType.REQUIRE_APPROVAL,
                         proposal=proposal,
                         action_hash=action_hash,
@@ -188,6 +199,7 @@ class GuardrailEngine:
                     )
                     violations.append(violation)
                     return self._finalize_result(
+                    actor=actor,
                         decision=DecisionType.DENY,
                         proposal=proposal,
                         action_hash=action_hash,
@@ -197,6 +209,7 @@ class GuardrailEngine:
 
                 # Valid human approval confirmed!
                 return self._finalize_result(
+                    actor=actor,
                     decision=DecisionType.ALLOW,
                     proposal=proposal,
                     action_hash=action_hash,
@@ -206,8 +219,9 @@ class GuardrailEngine:
                 )
 
             # Fallback for unclassified actions: fail-closed by requiring approval
-            req = self.approval_service.create_request(proposal)
+            req = self.approval_service.create_request(proposal, context=context)
             return self._finalize_result(
+                    actor=actor,
                 decision=DecisionType.REQUIRE_APPROVAL,
                 proposal=proposal,
                 action_hash=action_hash,
@@ -225,6 +239,7 @@ class GuardrailEngine:
                 severity="CRITICAL",
             )
             return self._finalize_result(
+                    actor=actor,
                 decision=DecisionType.ERROR,
                 proposal=proposal,
                 action_hash=action_hash,
@@ -235,6 +250,8 @@ class GuardrailEngine:
     def _finalize_result(
         self,
         decision: DecisionType,
+        actor: str | None = None,
+        *,
         proposal: ActionProposal,
         action_hash: str,
         reason: str,
@@ -243,7 +260,7 @@ class GuardrailEngine:
     ) -> GuardrailResult:
         """Log audit event to HashChainAuditStore and construct GuardrailResult."""
         audit_event = self.audit_store.log_event(
-            actor=proposal.proposed_by,
+            actor=actor or proposal.proposed_by,
             operation=proposal.action_name,
             decision=decision.value,
             policy_id=self.policy.policy_id,
@@ -255,6 +272,7 @@ class GuardrailEngine:
                 "category": proposal.category.value,
                 "targets": proposal.target_entities,
                 "violations_count": len(violations),
+                "proposed_by": proposal.proposed_by,
             },
         )
 

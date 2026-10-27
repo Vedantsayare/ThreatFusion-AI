@@ -251,5 +251,7 @@ def test_api_security_response_headers() -> None:
     assert res.status_code == 200
     assert res.headers.get("X-Content-Type-Options") == "nosniff"
     assert res.headers.get("X-Frame-Options") == "DENY"
-    assert res.headers.get("X-XSS-Protection") == "1; mode=block"
+    # OWASP recommends disabling the legacy XSS auditor ("0"); "1; mode=block"
+    # can itself introduce cross-site leaks in browsers that still implement it.
+    assert res.headers.get("X-XSS-Protection") == "0"
     assert "strict-origin" in (res.headers.get("Referrer-Policy") or "")

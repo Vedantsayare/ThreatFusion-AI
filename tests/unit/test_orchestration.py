@@ -114,7 +114,8 @@ class TestWorkflowSuccessfulEndToEnd:
         assert output.is_valid is True
         assert output.alert_id == "wazuh-alert-101"
 
-        # Check all 8 stages completed
+        # Check all 9 stages completed (enrich_indicators records SKIPPED when no
+        # enrichment service is configured, but it still runs and is recorded)
         expected_stages = [
             "receive_alert",
             "validate_input",
@@ -122,6 +123,7 @@ class TestWorkflowSuccessfulEndToEnd:
             "resolve_entities",
             "persist_to_graph",
             "gather_investigation_context",
+            "enrich_indicators",
             "perform_triage",
             "synthesize_final_result",
         ]

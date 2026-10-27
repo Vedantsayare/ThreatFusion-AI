@@ -73,6 +73,15 @@ class OCSFEndpoint(OCSFBaseModel):
     ip: str | None = None
     port: int | None = None
     protocol_name: str | None = None
+    domain: str | None = None
+
+
+class OCSFProcess(OCSFBaseModel):
+    """Process context reported by the source (e.g. Windows eventdata)."""
+
+    name: str | None = None
+    cmd_line: str | None = None
+    pid: int | None = None
 
 
 class OCSFUser(OCSFBaseModel):
@@ -139,6 +148,7 @@ class OCSFSecurityFinding(OCSFBaseModel):
     src_endpoint: OCSFEndpoint | None = None
     dst_endpoint: OCSFEndpoint | None = None
     user: OCSFUser | None = None
+    process: OCSFProcess | None = None
     attacks: list[OCSFAttack] = Field(default_factory=list)
 
     # Narrative message

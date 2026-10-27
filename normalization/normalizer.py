@@ -15,12 +15,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 from core.logger import get_logger
+from normalization.mitre import lookup_technique
 from normalization.models import (
     OCSFAttack,
     OCSFDevice,
     OCSFEndpoint,
     OCSFFindingInfo,
     OCSFMetadata,
+    OCSFProcess,
     OCSFProduct,
     OCSFSecurityFinding,
     OCSFTactic,
@@ -107,8 +109,11 @@ class OCSFNormalizer:
         # 8. User entity
         user = self._extract_user(raw_alert)
 
+        # 8b. Process context (Windows eventdata / Linux command fields)
+        process = self._extract_process(raw_alert)
+
         # 9. ATT&CK techniques
-        attacks = self._extract_attacks(rule_dict)
+        attacks = self._extract_attacks(rule_dict, unmapped)
 
         # 10. Message
         message = self._extract_message(raw_alert, rule_dict)
@@ -134,6 +139,7 @@ class OCSFNormalizer:
             src_endpoint=src_endpoint,
             dst_endpoint=dst_endpoint,
             user=user,
+            process=process,
             attacks=attacks,
             message=message,
             raw_data=raw_alert,
@@ -356,9 +362,15 @@ class OCSFNormalizer:
             or data_dict.get("dst_port")
             or raw_alert.get("dstport")
         )
+        dst_domain = self._safe_str(
+            data_dict.get("dst_domain")
+            or data_dict.get("domain")
+            or data_dict.get("hostname")
+            or raw_alert.get("dst_domain")
+        )
         dst_endpoint = (
-            OCSFEndpoint(ip=dst_ip, port=dst_port, protocol_name=protocol)
-            if (dst_ip or dst_port is not None)
+            OCSFEndpoint(ip=dst_ip, port=dst_port, protocol_name=protocol, domain=dst_domain)
+            if (dst_ip or dst_port is not None or dst_domain)
             else None
         )
 
@@ -369,10 +381,14 @@ class OCSFNormalizer:
         data = raw_alert.get("data")
         data_dict = data if isinstance(data, dict) else {}
 
+        eventdata = self._windows_eventdata(data_dict)
+
         user_name = self._safe_str(
             data_dict.get("dstuser")
             or data_dict.get("srcuser")
             or data_dict.get("user")
+            or eventdata.get("targetUserName")
+            or eventdata.get("subjectUserName")
             or raw_alert.get("dstuser")
             or raw_alert.get("srcuser")
             or raw_alert.get("user")
@@ -383,8 +399,50 @@ class OCSFNormalizer:
 
         return None
 
-    def _extract_attacks(self, rule_dict: dict[str, Any]) -> list[OCSFAttack]:
-        """Extract MITRE ATT&CK tactics and techniques."""
+    @staticmethod
+    def _windows_eventdata(data_dict: dict[str, Any]) -> dict[str, Any]:
+        win = data_dict.get("win")
+        if isinstance(win, dict):
+            eventdata = win.get("eventdata")
+            if isinstance(eventdata, dict):
+                return eventdata
+        return {}
+
+    def _extract_process(self, raw_alert: dict[str, Any]) -> OCSFProcess | None:
+        """Extract process name / command line when the source reports them."""
+        data = raw_alert.get("data")
+        data_dict = data if isinstance(data, dict) else {}
+        eventdata = self._windows_eventdata(data_dict)
+
+        cmd_line = self._safe_str(
+            eventdata.get("commandLine") or data_dict.get("command") or data_dict.get("cmdline")
+        )
+        image = self._safe_str(eventdata.get("image") or data_dict.get("process") or data_dict.get("program_name"))
+        name = image
+        if name is None and cmd_line:
+            name = cmd_line.split()[0]
+        if name and ("\\" in name or "/" in name):
+            name = name.replace("\\", "/").rsplit("/", 1)[-1]
+        if cmd_line is None and name is None:
+            return None
+        pid_raw = eventdata.get("processId") or data_dict.get("pid")
+        try:
+            pid = int(str(pid_raw), 0) if pid_raw is not None else None
+        except ValueError:
+            pid = None
+        return OCSFProcess(name=name, cmd_line=cmd_line, pid=pid)
+
+    def _extract_attacks(
+        self,
+        rule_dict: dict[str, Any],
+        unmapped: dict[str, Any] | None = None,
+    ) -> list[OCSFAttack]:
+        """Extract MITRE ATT&CK tactics and techniques.
+
+        Techniques come only from the alert. When the alert omits a technique's
+        name or tactic, the static ATT&CK reference supplies the label and the
+        field is recorded in ``unmapped["mitre_reference_labels"]``.
+        """
         mitre = rule_dict.get("mitre")
         if not isinstance(mitre, dict):
             return []
@@ -400,7 +458,16 @@ class OCSFNormalizer:
         for i in range(count):
             uid_val = ids[i] if i < len(ids) else (ids[0] if ids else "Unknown")
             tech_name = techniques[i] if i < len(techniques) else None
-            tactic_name = tactics[i] if i < len(tactics) else (tactics[0] if tactics else "Unknown")
+            tactic_name = tactics[i] if i < len(tactics) else (tactics[0] if tactics else None)
+
+            reference = lookup_technique(uid_val) if uid_val != "Unknown" else None
+            if reference is not None and (tech_name is None or tactic_name is None):
+                ref_name, ref_tactic = reference
+                tech_name = tech_name or ref_name
+                tactic_name = tactic_name or ref_tactic
+                if unmapped is not None:
+                    unmapped.setdefault("mitre_reference_labels", []).append(uid_val)
+            tactic_name = tactic_name or "Unknown"
 
             attacks.append(
                 OCSFAttack(

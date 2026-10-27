@@ -15,6 +15,7 @@ import json
 import re
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -99,10 +100,32 @@ class HashChainAuditStore:
 
     GENESIS_HASH = "0" * 64
 
-    def __init__(self, log_path: str | None = None) -> None:
+    def __init__(
+        self,
+        log_path: str | None = None,
+        on_append: Callable[[AuditEvent], None] | None = None,
+    ) -> None:
         self.log_path = log_path
         self._events: list[AuditEvent] = []
         self._last_hash: str = self.GENESIS_HASH
+        # Persistence hook invoked after each append (e.g. database write-through).
+        self.on_append = on_append
+
+    def restore(self, events: list[AuditEvent]) -> tuple[bool, str | None]:
+        """Load a previously persisted chain (startup only) and verify it.
+
+        The chain is loaded even when verification fails so the break stays
+        visible to auditors; new events continue from the last stored hash.
+        """
+        self._events = list(events)
+        self._last_hash = events[-1].event_hash if events else self.GENESIS_HASH
+        return self.verify_chain_integrity()
+
+    def get_event(self, event_id: str) -> AuditEvent | None:
+        for event in self._events:
+            if event.event_id == event_id:
+                return event
+        return None
 
     @property
     def event_count(self) -> int:
@@ -152,6 +175,9 @@ class HashChainAuditStore:
         event.event_hash = event.compute_hash(self._last_hash)
         self._events.append(event)
         self._last_hash = event.event_hash
+
+        if self.on_append is not None:
+            self.on_append(event)
 
         # Optional append-only file persistence
         if self.log_path:

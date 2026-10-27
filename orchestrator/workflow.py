@@ -44,6 +44,7 @@ def build_alert_workflow(
     4. resolve_entities: Deduplicates entities into ResolutionResult.
     5. persist_to_graph: Idempotent Neo4j write with bounded retries.
     6. gather_investigation_context: Queries graph neighborhood and historical count.
+    6b. enrich_indicators: Threat-intel verdicts + CMDB/IAM context (optional).
     7. perform_triage: Computes deterministic priority score and advisory steps.
     8. synthesize_final_result: Generates immutable final AlertWorkflowOutput.
     """
@@ -56,6 +57,7 @@ def build_alert_workflow(
     workflow.add_node("resolve_entities", nodes.resolve_entities)
     workflow.add_node("persist_to_graph", nodes.persist_to_graph)
     workflow.add_node("gather_investigation_context", nodes.gather_investigation_context)
+    workflow.add_node("enrich_indicators", nodes.enrich_indicators)
     workflow.add_node("perform_triage", nodes.perform_triage)
     workflow.add_node("synthesize_final_result", nodes.synthesize_final_result)
 
@@ -92,7 +94,8 @@ def build_alert_workflow(
         },
     )
 
-    workflow.add_edge("gather_investigation_context", "perform_triage")
+    workflow.add_edge("gather_investigation_context", "enrich_indicators")
+    workflow.add_edge("enrich_indicators", "perform_triage")
     workflow.add_edge("perform_triage", "synthesize_final_result")
     workflow.add_edge("synthesize_final_result", END)
 
@@ -110,6 +113,7 @@ class AlertWorkflowRunner:
         enable_graph_persistence: bool = True,
         max_retries: int = 2,
         nodes: AlertWorkflowNodes | None = None,
+        enrichment_service: Any | None = None,
     ) -> None:
         self.settings = settings
         self.graph_client = graph_client
@@ -121,6 +125,7 @@ class AlertWorkflowRunner:
             guardrail_engine=guardrail_engine,
             enable_graph_persistence=enable_graph_persistence,
             max_retries=max_retries,
+            enrichment_service=enrichment_service,
         )
         self.workflow: CompiledStateGraph[Any, Any, Any, Any] = build_alert_workflow(self.nodes)
 
@@ -129,6 +134,7 @@ class AlertWorkflowRunner:
         raw_alert: dict[str, Any],
         source: str = "wazuh",
         provenance: dict[str, Any] | None = None,
+        alert_id: str | None = None,
     ) -> AlertWorkflowOutput:
         """Execute the LangGraph workflow for a single security alert.
 
@@ -148,6 +154,8 @@ class AlertWorkflowRunner:
             "max_retries": self.max_retries,
             "workflow_status": WorkflowStatus.PENDING.value,
         }
+        if alert_id:
+            initial_state["alert_id"] = alert_id
 
         final_state: dict[str, Any] = await self.workflow.ainvoke(initial_state)
 

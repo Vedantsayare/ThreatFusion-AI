@@ -20,6 +20,8 @@ from graph.models import (
     RelationshipType,
 )
 
+pytestmark = pytest.mark.integration
+
 
 def _get_live_credentials() -> tuple[str, str, str]:
     """Read live credentials from local .env without exposing in logs."""

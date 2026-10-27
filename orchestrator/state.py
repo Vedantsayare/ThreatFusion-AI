@@ -90,6 +90,11 @@ class AlertWorkflowState(TypedDict, total=False):
     investigation_context: InvestigationContext | None
     investigation_error: str | None
 
+    # ── Enrichment Stage ─────────────────────────────────────────────────────
+    enrichment: dict[str, Any] | None
+    enrichment_error: str | None
+    approval_context: dict[str, Any]
+
     # ── Triage Stage ─────────────────────────────────────────────────────────
     triage_result: TriageResult | None
     triage_error: str | None
@@ -151,3 +156,4 @@ class AlertWorkflowOutput(BaseModel):
     audit_event_ids: list[str] = Field(default_factory=list)
     raw_alert_preserved: bool = True
     source_provenance: dict[str, Any] = Field(default_factory=dict)
+    enrichment: dict[str, Any] | None = None

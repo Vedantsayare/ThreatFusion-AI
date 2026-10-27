@@ -58,7 +58,9 @@ def _make_settings(**kwargs: Any) -> AppSettings:
         "MISP_VERIFY_SSL": "true",
     }
     env.update(kwargs)
-    return AppSettings(**env)  # type: ignore[arg-type]
+    # Init kwargs must use field names: AppSettings ignores unknown (e.g. upper-case)
+    # keys, which previously made APP_ENV="production" silently fall back to the env.
+    return AppSettings(**{k.lower(): v for k, v in env.items()})  # type: ignore[arg-type]
 
 
 class AsyncMockRecord:

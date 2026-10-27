@@ -8,6 +8,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from api.app import create_app
+from api.auth import APIKeyRegistry, configure_registry
 from api.routes import init_api_dependencies
 from api.store import InvestigationStore
 from guardrails.engine import GuardrailEngine, GuardrailPolicy
@@ -37,8 +38,20 @@ def test_client() -> TestClient:
         store=store,
     )
 
+    configure_registry(
+        APIKeyRegistry(
+            "viewer:viewer:test-viewer-key-123456,"
+            "analyst:analyst:test-analyst-key-123456,"
+            "lead-secops-analyst:approver:test-approver-key-123456"
+        )
+    )
     app = create_app()
-    return TestClient(app)
+    client = TestClient(app)
+    client.headers["Authorization"] = "Bearer test-analyst-key-123456"
+    return client
+
+
+APPROVER = {"Authorization": "Bearer test-approver-key-123456"}
 
 
 def test_health_endpoints(test_client: TestClient) -> None:
@@ -157,14 +170,15 @@ def test_approval_decision_workflow(test_client: TestClient) -> None:
         )
     )
 
-    # 1. Reject first
+    # 1. Reject first (reviewer identity comes from the API key, not the body)
     reject_res = test_client.post(
         f"/api/v1/approvals/{req.request_id}/decide",
         json={
-            "reviewer_id": "lead-secops-analyst",
+            "reviewer_id": "someone-else-spoofed",
             "decision": "REJECT",
             "reason": "False positive test run",
         },
+        headers=APPROVER,
     )
     assert reject_res.status_code == 200
     reject_data = reject_res.json()
@@ -178,5 +192,6 @@ def test_approval_decision_workflow(test_client: TestClient) -> None:
             "reviewer_id": "lead-secops-analyst",
             "decision": "APPROVE",
         },
+        headers=APPROVER,
     )
     assert missing_res.status_code == 404

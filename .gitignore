@@ -72,3 +72,11 @@ logs/
 
 # ─── Jupyter ─────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
+
+# ─── Local SQLite persistence (PERSISTENCE_BACKEND=sqlite) ──────────────────
+*.db
+*.db-journal
+
+# Playwright
+dashboard/test-results/
+dashboard/playwright-report/

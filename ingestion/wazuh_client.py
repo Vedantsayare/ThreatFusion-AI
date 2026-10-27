@@ -204,14 +204,15 @@ class WazuhClient:
             )
 
         data = payload.get("data")
-        token = data.get("token") if isinstance(data, dict) else None
-        if not token or not isinstance(token, str):
+        raw_token = data.get("token") if isinstance(data, dict) else None
+        if not raw_token or not isinstance(raw_token, str):
             raise WazuhAuthError("Wazuh authentication response missing JWT token in data.token")
+        token: str = raw_token
 
         self._token = token
         self._token_acquired_at = time.monotonic()
         logger.info("wazuh_authenticated", base_url=self._base_url, user=self._user)
-        return self._token
+        return token
 
     async def _ensure_token(self) -> str:
         """Ensure a valid authentication token is cached, acquiring one if needed."""
