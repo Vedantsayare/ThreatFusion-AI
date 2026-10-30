@@ -2,9 +2,6 @@
 
 > **An agentic SOC copilot with temporal knowledge-graph memory.** It ingests security alerts, normalizes them to OCSF, enriches and correlates them into incidents, scores them with explainable deterministic rules, and routes every response action through human approval and a tamper-evident audit log.
 
-**Status: working lab / portfolio release, not production-ready.** The end-to-end workflow below was verified on macOS (Apple Silicon) in this repository. Every response action is **simulated**, and the demo data is **synthetic** and labelled as such. See [Project status](#project-status) for exactly what was verified.
-
----
 
 ## Table of contents
 
